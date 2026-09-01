@@ -47,11 +47,20 @@ import {
 } from "./worker-operation-session.js";
 
 export interface RemoteSyncRef {
-  type: "heads" | "tags" | "nostr";
+  type: "heads" | "tags";
   name: string;
   ref: string;
   commit?: string;
 }
+
+type RemoteVerificationRef =
+  | RemoteSyncRef
+  | {
+      type: "nostr";
+      name: string;
+      ref: string;
+      commit?: string;
+    };
 
 export type RemoteRefObservation =
   | { status: "confirmed"; refs: string[] }
@@ -814,7 +823,7 @@ async function resolveRequestedRefs(
 export async function inspectRequestedRemoteRefs(params: {
   workerApi: any;
   remoteUrl: string;
-  refs: RemoteSyncRef[];
+  refs: RemoteVerificationRef[];
 }): Promise<RemoteRefObservation> {
   if (!params.workerApi?.listServerRefs) {
     return {
@@ -851,7 +860,7 @@ export async function inspectRequestedRemoteRefs(params: {
 export async function verifyRequestedRemoteRefs(params: {
   workerApi: any;
   remoteUrl: string;
-  refs: RemoteSyncRef[];
+  refs: RemoteVerificationRef[];
 }): Promise<string[]> {
   const observation = await inspectRequestedRemoteRefs(params);
   if (observation.status === "confirmed") return observation.refs;
