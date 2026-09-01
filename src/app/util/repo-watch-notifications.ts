@@ -25,6 +25,7 @@ import {
   GIT_STATUS_CLOSED,
   GIT_STATUS_DRAFT,
   GIT_STATUS_OPEN,
+  isTrustedImportedRepoEvent,
   parseRepoAnnouncementEvent,
   type RepoAnnouncementEvent,
 } from "@nostr-git/core/events"
@@ -736,11 +737,20 @@ export const getRepoWatchNotificationCandidates = ({
   const issuesByRootId = new Map<string, TrustedEvent>()
   const prsByRootId = new Map<string, TrustedEvent>()
   const candidates = new Map<string, NotificationCandidate>()
+  const isTrustedForRepo = (repo: RepoWatchNotificationRepo, event: TrustedEvent) => {
+    const repoEvent = repo.repoEvent as RepoAnnouncementEvent | undefined
+    return isTrustedImportedRepoEvent({
+      event,
+      repoOwner: repoEvent?.pubkey || repo.pubkey,
+      maintainers: repoEvent ? getRepoMaintainers(repoEvent) : [repo.pubkey],
+    })
+  }
 
   for (const issue of issues) {
     if (issue.kind !== GIT_ISSUE) continue
     const repo = reposByAddress.get(getRepoAddress(issue))
     if (!repo) continue
+    if (!isTrustedForRepo(repo, issue)) continue
 
     issueReposByRootId.set(issue.id, repo)
     issuesByRootId.set(issue.id, issue)
@@ -758,6 +768,7 @@ export const getRepoWatchNotificationCandidates = ({
     if (pullRequest.kind !== GIT_PULL_REQUEST) continue
     const repo = reposByAddress.get(getRepoAddress(pullRequest))
     if (!repo) continue
+    if (!isTrustedForRepo(repo, pullRequest)) continue
 
     prReposByRootId.set(pullRequest.id, repo)
     prsByRootId.set(pullRequest.id, pullRequest)
@@ -775,6 +786,7 @@ export const getRepoWatchNotificationCandidates = ({
     if (update.kind !== GIT_PULL_REQUEST_UPDATE) continue
     const repo = reposByAddress.get(getRepoAddress(update))
     if (!repo) continue
+    if (!isTrustedForRepo(repo, update)) continue
 
     addCandidate({
       candidates,
@@ -800,6 +812,7 @@ export const getRepoWatchNotificationCandidates = ({
     const prCandidateRepo = prRepo || (fallbackSection === "prs" ? fallbackRepo : undefined)
 
     if (issueCandidateRepo) {
+      if (!isTrustedForRepo(issueCandidateRepo, status)) continue
       addCandidate({
         candidates,
         repo: issueCandidateRepo,
@@ -811,6 +824,7 @@ export const getRepoWatchNotificationCandidates = ({
     }
 
     if (prCandidateRepo) {
+      if (!isTrustedForRepo(prCandidateRepo, status)) continue
       addCandidate({
         candidates,
         repo: prCandidateRepo,
@@ -835,6 +849,7 @@ export const getRepoWatchNotificationCandidates = ({
     const prCandidateRepo = prRepo || (fallbackSection === "prs" ? fallbackRepo : undefined)
 
     if (issueCandidateRepo) {
+      if (!isTrustedForRepo(issueCandidateRepo, comment)) continue
       addCandidate({
         candidates,
         repo: issueCandidateRepo,
@@ -846,6 +861,7 @@ export const getRepoWatchNotificationCandidates = ({
     }
 
     if (prCandidateRepo) {
+      if (!isTrustedForRepo(prCandidateRepo, comment)) continue
       addCandidate({
         candidates,
         repo: prCandidateRepo,

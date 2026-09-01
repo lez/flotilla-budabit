@@ -364,6 +364,37 @@ describe("repo watch notifications", () => {
     ).toEqual([{path: `${repoPath}/issues`, latestEvent: issue}])
   })
 
+  it("ignores foreign imported activity while preserving native contributions", async () => {
+    const {getRepoWatchNotificationCandidates} = await import("./repo-watch-notifications")
+    const nativeIssue = makeEvent({
+      id: "native-issue",
+      kind: GIT_ISSUE,
+      pubkey: outsider,
+      tags: [["a", repoAddress]],
+    })
+    const importedIssue = {
+      ...nativeIssue,
+      id: "imported-issue",
+      tags: [...nativeIssue.tags, ["imported", ""]],
+    }
+    const ownerImport = {...importedIssue, id: "owner-import", pubkey: owner}
+
+    expect(
+      getRepoWatchNotificationCandidates({
+        repos: [makeRepo()],
+        issues: [nativeIssue, importedIssue],
+        currentPubkey: viewer,
+      }),
+    ).toEqual([{path: `${repoPath}/issues`, latestEvent: nativeIssue}])
+    expect(
+      getRepoWatchNotificationCandidates({
+        repos: [makeRepo()],
+        issues: [ownerImport],
+        currentPubkey: viewer,
+      }),
+    ).toEqual([{path: `${repoPath}/issues`, latestEvent: ownerImport}])
+  })
+
   it("carries only announcement-declared relays with real repository triggers", async () => {
     const {getRepoWatchNotificationCandidates} = await import("./repo-watch-notifications")
     const issue = makeEvent({
@@ -490,9 +521,7 @@ describe("repo watch notifications", () => {
         repoEvents,
         isDeleted: () => false,
       })
-      expect(repos.find(repo => repo.address === repoAddress)?.repoEvent).toBe(
-        equalTimestampWinner,
-      )
+      expect(repos.find(repo => repo.address === repoAddress)?.repoEvent).toBe(equalTimestampWinner)
     }
   })
 
@@ -510,11 +539,7 @@ describe("repo watch notifications", () => {
       kind: GIT_REPO_ANNOUNCEMENT,
       pubkey: owner,
       created_at: 20,
-      tags: [
-        ["d", repoIdentifier],
-        ["deleted"],
-        ["relays", "wss://deleted.example"],
-      ],
+      tags: [["d", repoIdentifier], ["deleted"], ["relays", "wss://deleted.example"]],
     })
 
     const repos = getRepoNotificationRepos({

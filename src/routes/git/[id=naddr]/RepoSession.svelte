@@ -88,6 +88,7 @@
     isCommentEvent,
     createRepoStateEvent,
     isImportedEvent,
+    isTrustedImportedRepoEvent,
     resolveStatusState,
   } from "@nostr-git/core/events"
   import {
@@ -725,6 +726,13 @@
       isDeleted: event => isDeletedRepositoryEvent(event),
       onEvent: receiveRepoLiveEvent,
       loadGap: rootId => loadRootGaps([rootId], "foreground"),
+      getImportedAuthority: () => {
+        const event = getStore(repoEventStore)
+        return {
+          repoOwner: event?.pubkey || repoPubkey,
+          maintainers: getRepoMaintainers(event || null),
+        }
+      },
     })
     repoRootResolverWaiters.forEach(resolve => resolve())
     void history.loadRecent()
@@ -1685,39 +1693,74 @@
     })
   }
 
-  function deriveIssues(repoAddresses: Readable<string[]>) {
+  function deriveIssues(
+    repoAddresses: Readable<string[]>,
+    repoEvent: Readable<RepoAnnouncementEvent | undefined>,
+  ) {
     const scopedIssueEvents = deriveAddressScopedEvents(repoAddresses, [GIT_ISSUE])
 
     return derived(
-      [scopedIssueEvents, repoAddresses],
-      ([events, addresses]: [TrustedEvent[], string[]]) => {
+      [scopedIssueEvents, repoAddresses, repoEvent],
+      ([events, addresses, announcement]: [
+        TrustedEvent[],
+        string[],
+        RepoAnnouncementEvent | undefined,
+      ]) => {
+        const authority = {
+          repoOwner: announcement?.pubkey || repoPubkey,
+          maintainers: getRepoMaintainers(announcement || null),
+        }
         return (events || []).filter(event =>
-          isAcceptedRepoRootEvent(event, addresses),
+          isAcceptedRepoRootEvent(event, addresses, authority),
         ) as IssueEvent[]
       },
     ) as Readable<IssueEvent[]>
   }
 
-  function derivePullRequests(repoAddresses: Readable<string[]>) {
+  function derivePullRequests(
+    repoAddresses: Readable<string[]>,
+    repoEvent: Readable<RepoAnnouncementEvent | undefined>,
+  ) {
     const scopedPullRequestEvents = deriveAddressScopedEvents(repoAddresses, [GIT_PULL_REQUEST])
 
     return derived(
-      [scopedPullRequestEvents, repoAddresses],
-      ([events, addresses]: [TrustedEvent[], string[]]) => {
+      [scopedPullRequestEvents, repoAddresses, repoEvent],
+      ([events, addresses, announcement]: [
+        TrustedEvent[],
+        string[],
+        RepoAnnouncementEvent | undefined,
+      ]) => {
+        const authority = {
+          repoOwner: announcement?.pubkey || repoPubkey,
+          maintainers: getRepoMaintainers(announcement || null),
+        }
         return (events || []).filter(event =>
-          isAcceptedRepoRootEvent(event, addresses),
+          isAcceptedRepoRootEvent(event, addresses, authority),
         ) as PullRequestEvent[]
       },
     ) as Readable<PullRequestEvent[]>
   }
 
-  function derivePullRequestUpdates(repoAddresses: Readable<string[]>) {
-    return deriveAddressScopedEvents(repoAddresses, [GIT_PULL_REQUEST_UPDATE]) as Readable<
-      TrustedEvent[]
-    >
+  function derivePullRequestUpdates(
+    repoAddresses: Readable<string[]>,
+    repoEvent: Readable<RepoAnnouncementEvent | undefined>,
+  ) {
+    const updates = deriveAddressScopedEvents(repoAddresses, [GIT_PULL_REQUEST_UPDATE])
+    return derived([updates, repoEvent], ([$updates, $repoEvent]) =>
+      ($updates || []).filter(event =>
+        isTrustedImportedRepoEvent({
+          event,
+          repoOwner: $repoEvent?.pubkey || repoPubkey,
+          maintainers: getRepoMaintainers($repoEvent || null),
+        }),
+      ),
+    ) as Readable<TrustedEvent[]>
   }
 
-  function deriveStatusEvents(repoAddresses: Readable<string[]>) {
+  function deriveStatusEvents(
+    repoAddresses: Readable<string[]>,
+    repoEvent: Readable<RepoAnnouncementEvent | undefined>,
+  ) {
     const scopedStatusEvents = deriveAddressScopedEvents(repoAddresses, [
       GIT_STATUS_OPEN,
       GIT_STATUS_DRAFT,
@@ -1726,9 +1769,15 @@
     ])
 
     return derived(
-      [scopedStatusEvents, repoAddresses],
-      ([events, addresses]: [TrustedEvent[], string[]]) => {
-        return (events || []) as StatusEvent[]
+      [scopedStatusEvents, repoEvent],
+      ([events, announcement]: [TrustedEvent[], RepoAnnouncementEvent | undefined]) => {
+        return (events || []).filter(event =>
+          isTrustedImportedRepoEvent({
+            event,
+            repoOwner: announcement?.pubkey || repoPubkey,
+            maintainers: getRepoMaintainers(announcement || null),
+          }),
+        ) as StatusEvent[]
       },
     ) as Readable<StatusEvent[]>
   }
@@ -2042,10 +2091,10 @@
   })
   const rootRepoRelaysStore = deriveRepoRelays(repoEventStore)
   const repoRelaysStore: Readable<string[]> = rootRepoRelaysStore
-  const realIssuesStore = deriveIssues(repoAddressesStore)
-  const realPullRequestsStore = derivePullRequests(repoAddressesStore)
-  const realPullRequestUpdatesStore = derivePullRequestUpdates(repoAddressesStore)
-  const realStatusEventsStore = deriveStatusEvents(repoAddressesStore)
+  const realIssuesStore = deriveIssues(repoAddressesStore, repoEventStore)
+  const realPullRequestsStore = derivePullRequests(repoAddressesStore, repoEventStore)
+  const realPullRequestUpdatesStore = derivePullRequestUpdates(repoAddressesStore, repoEventStore)
+  const realStatusEventsStore = deriveStatusEvents(repoAddressesStore, repoEventStore)
   const issuesStore = deferUntilRepoActivityHydrated<IssueEvent[]>([], () => realIssuesStore)
   const pullRequestsStore = deferUntilRepoActivityHydrated<PullRequestEvent[]>(
     [],
@@ -2058,11 +2107,20 @@
   const allRootIdsStore = deriveAllRootIds(issuesStore, pullRequestsStore)
   const rootStatusEventsStore = deriveRootScopedStatusEvents(allRootIdsStore)
   const mergedStatusEventsStore: Readable<StatusEvent[]> = derived(
-    [statusEventsStore, rootStatusEventsStore],
-    ([$addressScopedEvents, $rootScopedEvents]) => {
+    [statusEventsStore, rootStatusEventsStore, repoEventStore],
+    ([$addressScopedEvents, $rootScopedEvents, $repoEvent]) => {
       const byId = new Map<string, StatusEvent>()
 
       for (const event of [...($addressScopedEvents || []), ...($rootScopedEvents || [])]) {
+        if (
+          !isTrustedImportedRepoEvent({
+            event,
+            repoOwner: $repoEvent?.pubkey || repoPubkey,
+            maintainers: getRepoMaintainers($repoEvent || null),
+          })
+        ) {
+          continue
+        }
         const existing = byId.get(event.id)
 
         if (!existing || event.created_at > existing.created_at) {
@@ -2164,9 +2222,17 @@
     repoEventStore,
   )
   const commentEventsStore: Readable<CommentEvent[]> = derived(
-    [rawCommentEventsStore, hiddenRootIdsStore],
-    ([$comments, $hiddenIds]) =>
-      (($comments || []) as CommentEvent[]).filter(comment => !$hiddenIds.has(comment.id)),
+    [rawCommentEventsStore, hiddenRootIdsStore, repoEventStore],
+    ([$comments, $hiddenIds, $repoEvent]) =>
+      (($comments || []) as CommentEvent[]).filter(
+        comment =>
+          !$hiddenIds.has(comment.id) &&
+          isTrustedImportedRepoEvent({
+            event: comment,
+            repoOwner: $repoEvent?.pubkey || repoPubkey,
+            maintainers: getRepoMaintainers($repoEvent || null),
+          }),
+      ),
   )
   const repoFeedActivityStore: Readable<TrustedEvent[]> = derived(
     [issuesStore, pullRequestsStore, hiddenRootIdsStore],

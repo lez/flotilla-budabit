@@ -135,6 +135,11 @@ export type IssueTag =
   | ["e", string]
   | ["q", string, ...string[]]
   | ["imeta", ...string[]]
+  | ["proxy", string, string]
+  | ["source-author", string, string]
+  | ["imported", string]
+  | ["original_date", string]
+  | ["original_updated_at", string]
 
 export interface IssueEvent extends NostrEvent {
   id: string
@@ -177,6 +182,11 @@ export type PullRequestTag =
   | ["target-branch", string]
   | ["e", string]
   | ["merge-base", string]
+  | ["proxy", string, string]
+  | ["source-author", string, string]
+  | ["imported", string]
+  | ["original_date", string]
+  | ["original_updated_at", string]
 
 export interface PullRequestEvent extends NostrEvent {
   kind: typeof GIT_PULL_REQUEST
@@ -197,6 +207,11 @@ export type PullRequestUpdateTag =
   | ["c", string]
   | ["clone", ...string[]]
   | ["merge-base", string]
+  | ["proxy", string, string]
+  | ["source-author", string, string]
+  | ["imported", string]
+  | ["original_date", string]
+  | ["original_updated_at", string]
 
 export interface PullRequestUpdateEvent extends NostrEvent {
   kind: typeof GIT_PULL_REQUEST_UPDATE
@@ -227,6 +242,11 @@ export type StatusTag =
   | ["e", string, "", "mention"]
   | ["merge-commit", string]
   | ["applied-as-commits", ...string[]]
+  | ["proxy", string, string]
+  | ["source-author", string, string]
+  | ["imported", string]
+  | ["original_date", string]
+  | ["original_updated_at", string]
 
 export interface StatusEvent extends NostrEvent {
   kind:

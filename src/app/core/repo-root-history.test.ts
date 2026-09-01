@@ -36,7 +36,12 @@ const makeRootEvent = ({
   kind,
   tags: [
     ...addresses.map(value => ["a", value]),
-    ...(kind === 1618 ? [["c", "1".repeat(40)], ["merge-base", "2".repeat(40)]] : []),
+    ...(kind === 1618
+      ? [
+          ["c", "1".repeat(40)],
+          ["merge-base", "2".repeat(40)],
+        ]
+      : []),
   ],
 })
 
@@ -157,6 +162,25 @@ describe("repository root history", () => {
     expect(isAcceptedRepoRootEvent(malformedTip, [address])).toBe(false)
     expect(isAcceptedRepoRootEvent(malformedMergeBase, [address])).toBe(false)
     expect(isAcceptedRepoRootEvent(duplicateMergeBase, [address])).toBe(false)
+  })
+
+  it("requires owner or direct-maintainer authority only for imported roots", () => {
+    const owner = "a".repeat(64)
+    const maintainer = "b".repeat(64)
+    const foreign = "c".repeat(64)
+    const authority = {repoOwner: owner, maintainers: [maintainer]}
+    const imported = (pubkey: string) => ({
+      ...makeRootEvent({id: pubkey[0]}),
+      pubkey,
+      tags: [...makeRootEvent({id: pubkey[0]}).tags, ["imported", ""]],
+    })
+
+    expect(isAcceptedRepoRootEvent(imported(owner), [address], authority)).toBe(true)
+    expect(isAcceptedRepoRootEvent(imported(maintainer), [address], authority)).toBe(true)
+    expect(isAcceptedRepoRootEvent(imported(foreign), [address], authority)).toBe(false)
+    expect(
+      isAcceptedRepoRootEvent({...makeRootEvent({id: "n"}), pubkey: foreign}, [address], authority),
+    ).toBe(true)
   })
 
   it("tracks relay cursors independently and exhausts empty EOSE relays", async () => {

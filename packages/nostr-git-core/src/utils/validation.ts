@@ -76,6 +76,18 @@ export const PTag = z.tuple([z.literal("p"), z.string()]).rest(z.string())
 export const CTag = z.tuple([z.literal("c"), z.string()])
 export const QReferenceTag = z.tuple([z.literal("q"), z.string()]).rest(z.string())
 export const ImetaTag = z.tuple([z.literal("imeta")]).rest(z.string())
+export const ProxyTag = z.tuple([z.literal("proxy"), z.string(), z.string()])
+export const SourceAuthorTag = z.tuple([z.literal("source-author"), z.string(), z.string()])
+export const ImportedTag = z.tuple([z.literal("imported"), z.string()])
+export const OriginalDateTag = z.tuple([z.literal("original_date"), z.string()])
+export const OriginalUpdatedAtTag = z.tuple([z.literal("original_updated_at"), z.string()])
+const ImportedBridgeTagSchemas = [
+  ProxyTag,
+  SourceAuthorTag,
+  ImportedTag,
+  OriginalDateTag,
+  OriginalUpdatedAtTag,
+] as const
 
 // Issue tags (kind 1621)
 export const SubjectTag = z.tuple([z.literal("subject"), z.string()])
@@ -86,6 +98,7 @@ export const IssueTagSchema = z.union([
   HashtagTag,
   QReferenceTag,
   ImetaTag,
+  ...ImportedBridgeTagSchemas,
 ])
 export const IssueTagsSchema = z.array(IssueTagSchema)
 
@@ -120,6 +133,7 @@ export const StatusTagSchema = z.union([
   QTag,
   MergeCommitTag,
   AppliedAsCommitsTag,
+  ...ImportedBridgeTagSchemas,
 ])
 export const StatusTagsSchema = z.array(StatusTagSchema)
 
@@ -138,6 +152,7 @@ export const PullRequestTagSchema = z.union([
   z.tuple([z.literal("target-branch"), z.string()]),
   z.tuple([z.literal("merge-base"), z.string()]),
   z.tuple([z.literal("e"), z.string()]),
+  ...ImportedBridgeTagSchemas,
 ])
 export const PullRequestTagsSchema = z.array(PullRequestTagSchema)
 
@@ -153,6 +168,7 @@ export const PullRequestUpdateTagSchema = z.union([
   CTag,
   CloneTag,
   z.tuple([z.literal("merge-base"), z.string()]),
+  ...ImportedBridgeTagSchemas,
 ])
 export const PullRequestUpdateTagsSchema = z.array(PullRequestUpdateTagSchema)
 

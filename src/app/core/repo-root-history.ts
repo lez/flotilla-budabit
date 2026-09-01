@@ -10,7 +10,12 @@ import {
   type Filter,
   type TrustedEvent,
 } from "@welshman/util"
-import {GIT_LABEL, GIT_PULL_REQUEST, GIT_PULL_REQUEST_UPDATE} from "@nostr-git/core/events"
+import {
+  GIT_LABEL,
+  GIT_PULL_REQUEST,
+  GIT_PULL_REQUEST_UPDATE,
+  isTrustedImportedRepoEvent,
+} from "@nostr-git/core/events"
 import {validatePullRequestEvent} from "@nostr-git/core/utils"
 import {
   requestFiniteRelay,
@@ -125,7 +130,13 @@ export type RepoRootResolverOptions = {
   isDeleted: (event: TrustedEvent) => boolean
   onEvent: (event: TrustedEvent, relay: string) => void
   loadGap: (rootId: string) => Promise<FiniteRelayResult[]>
+  getImportedAuthority?: () => RepoImportedAuthority
   timeoutMs?: number
+}
+
+export type RepoImportedAuthority = {
+  repoOwner?: string
+  maintainers: Iterable<string>
 }
 
 const chunkValues = (values: string[], size: number) => {
@@ -176,9 +187,11 @@ const getPullRequestRootId = (event: TrustedEvent) =>
 export const isAcceptedRepoRootEvent = (
   event: TrustedEvent,
   addresses: string[],
+  authority: RepoImportedAuthority = {maintainers: []},
 ): event is TrustedEvent & {kind: typeof GIT_ISSUE | typeof GIT_PULL_REQUEST} => {
   if (event.kind !== GIT_ISSUE && event.kind !== GIT_PULL_REQUEST) return false
   if (event.kind === GIT_PULL_REQUEST && !validatePullRequestEvent(event).success) return false
+  if (!isTrustedImportedRepoEvent({event, ...authority})) return false
 
   try {
     return Boolean(getMatchingRepoPublicationAddress(event, addresses))
@@ -187,7 +200,11 @@ export const isAcceptedRepoRootEvent = (
   }
 }
 
-const isAcceptedRepoRootLookupEvent = (event: TrustedEvent, addresses: string[]) => {
+const isAcceptedRepoRootLookupEvent = (
+  event: TrustedEvent,
+  addresses: string[],
+  authority: RepoImportedAuthority = {maintainers: []},
+) => {
   if (
     event.kind !== GIT_ISSUE &&
     event.kind !== GIT_PULL_REQUEST &&
@@ -195,6 +212,7 @@ const isAcceptedRepoRootLookupEvent = (event: TrustedEvent, addresses: string[])
   ) {
     return false
   }
+  if (!isTrustedImportedRepoEvent({event, ...authority})) return false
 
   try {
     return Boolean(getMatchingRepoPublicationAddress(event, addresses))
@@ -247,7 +265,7 @@ export const createRepoRootResolver =
         if (
           event.id !== id ||
           options.isDeleted(event) ||
-          !isAcceptedRepoRootLookupEvent(event, addresses)
+          !isAcceptedRepoRootLookupEvent(event, addresses, options.getImportedAuthority?.())
         ) {
           return
         }
@@ -304,7 +322,11 @@ export const createRepoRootResolver =
             results: FiniteRelayResult[]
           }>
         | undefined
-      if (!event || options.isDeleted(event) || !isAcceptedRepoRootLookupEvent(event, addresses)) {
+      if (
+        !event ||
+        options.isDeleted(event) ||
+        !isAcceptedRepoRootLookupEvent(event, addresses, options.getImportedAuthority?.())
+      ) {
         const exact = await requestExact(requestedId, relays, addresses, signal, accepted => {
           if (accepted.kind !== GIT_PULL_REQUEST_UPDATE || eagerRootLookup) return
           const rootId = getPullRequestRootId(accepted)
@@ -314,7 +336,7 @@ export const createRepoRootResolver =
             rootId === accepted.id ||
             (cachedRoot &&
               !options.isDeleted(cachedRoot) &&
-              isAcceptedRepoRootEvent(cachedRoot, addresses))
+              isAcceptedRepoRootEvent(cachedRoot, addresses, options.getImportedAuthority?.()))
           ) {
             return
           }
@@ -338,7 +360,7 @@ export const createRepoRootResolver =
         if (
           cachedRoot &&
           !options.isDeleted(cachedRoot) &&
-          isAcceptedRepoRootEvent(cachedRoot, addresses)
+          isAcceptedRepoRootEvent(cachedRoot, addresses, options.getImportedAuthority?.())
         ) {
           root = cachedRoot
         } else {
@@ -346,14 +368,17 @@ export const createRepoRootResolver =
             ? await eagerRootLookup
             : await requestExact(rootId, relays, addresses, signal)
           results.push(...exactRoot.results)
-          if (!exactRoot.event || !isAcceptedRepoRootEvent(exactRoot.event, addresses)) {
+          if (
+            !exactRoot.event ||
+            !isAcceptedRepoRootEvent(exactRoot.event, addresses, options.getImportedAuthority?.())
+          ) {
             return {status: summarizeRepoRootResults(results, signal), requestedId}
           }
           root = exactRoot.event
         }
       }
 
-      if (!isAcceptedRepoRootEvent(root, addresses)) {
+      if (!isAcceptedRepoRootEvent(root, addresses, options.getImportedAuthority?.())) {
         return {status: summarizeRepoRootResults(results, signal), requestedId}
       }
 

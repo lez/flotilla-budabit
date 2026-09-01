@@ -10,6 +10,7 @@
     type LabelEvent,
     type RepoAnnouncementEvent,
     type StatusEvent,
+    isTrustedImportedRepoEvent,
   } from "@nostr-git/core/events"
   import {resolveIssueStatus} from "@nostr-git/core/events"
   import {
@@ -682,7 +683,15 @@
     filterVisibleAfterDeletesAndEdits(
       threadComments ? (($threadComments || []) as CommentEvent[]) : [],
       $editedTargetIds,
-    ).filter(comment => !hiddenRootIds.has(comment.id)),
+    ).filter(
+      comment =>
+        !hiddenRootIds.has(comment.id) &&
+        isTrustedImportedRepoEvent({
+          event: comment,
+          repoOwner: currentRepoOwner,
+          maintainers: issueMaintainers,
+        }),
+    ),
   )
 
   const getStatusFilter = () => ({
@@ -691,8 +700,19 @@
   })
 
   const statusEvents = $derived.by(() => {
-    return deriveEventsAsc(deriveEventsById({repository, filters: [getStatusFilter()]}))
+    const events = deriveEventsAsc(deriveEventsById({repository, filters: [getStatusFilter()]}))
+    return events
   })
+
+  const trustedStatusEvents = $derived.by(() =>
+    (($statusEvents || []) as StatusEvent[]).filter(status =>
+      isTrustedImportedRepoEvent({
+        event: status,
+        repoOwner: currentRepoOwner,
+        maintainers: issueMaintainers,
+      }),
+    ),
+  )
 
   // Centralized NIP-32 labels via store; avoid calling .get() in Svelte 5
   const labelsNormalized = $derived.by(() => {
@@ -726,9 +746,9 @@
 
   // Resolve effective status using precedence rules (maintainers > author > others; kind; recency)
   const resolved = $derived.by(() => {
-    if (!$statusEvents || !issue) return undefined
+    if (!issue) return undefined
     return resolveIssueStatus(
-      {root: issueEvent as any, comments: [], statuses: $statusEvents as any},
+      {root: issueEvent as any, comments: [], statuses: trustedStatusEvents as any},
       issue.author.pubkey,
       issueMaintainers,
       {repoOwner: currentRepoOwner, importedRoot: isMirrored},
@@ -986,7 +1006,7 @@
               rootId={issue.id}
               rootKind={GIT_ISSUE}
               rootAuthor={issue.author.pubkey}
-              statusEvents={($statusEvents || []) as StatusEvent[]}
+              statusEvents={trustedStatusEvents}
               actorPubkey={$pubkey}
               compact={true}
               {isMirrored}
@@ -1161,7 +1181,7 @@
           rootId={issue.id}
           rootKind={GIT_ISSUE}
           rootAuthor={issue.author.pubkey}
-          statusEvents={($statusEvents || []) as StatusEvent[]}
+          statusEvents={trustedStatusEvents}
           actorPubkey={$pubkey}
           compact={false}
           {isMirrored}

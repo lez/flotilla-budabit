@@ -40,6 +40,11 @@ export type CommentTag =
   | ["line", string, "del"]
   | ["l", string]
   | ["repo", string]
+  | ["proxy", string, string]
+  | ["source-author", string, string]
+  | ["imported", string]
+  | ["original_date", string]
+  | ["original_updated_at", string]
 
 /**
  * NIP-22 Comment Event
@@ -145,7 +150,7 @@ const appendRelayAndPubkey = (base: string[], relay?: string, pubkey?: string) =
 const appendRelay = (base: string[], relay?: string) => (relay ? [...base, relay] : base)
 
 /**
-  * Create a NIP-22 comment for NIP-34 git threads.
+ * Create a NIP-22 comment for NIP-34 git threads.
  * Root tags always point at the original issue/PR, while parent tags point at
  * the immediate event being replied to. Repo references are encoded as q-tags.
  */

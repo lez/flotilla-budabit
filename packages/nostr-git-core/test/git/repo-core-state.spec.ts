@@ -96,4 +96,21 @@ describe("authorized repository state selection", () => {
       maintainerState,
     )
   })
+
+  it("does not let parsed metadata widen a present owner announcement", () => {
+    const widenedContext: RepoContext = {
+      ...context,
+      repo: {owner: foreign, repoId: "repo", maintainers: [foreign]},
+      maintainers: [foreign],
+    }
+
+    expect(RepoCore.getOwnerPubkey(widenedContext)).toBe(owner)
+    expect(RepoCore.isTrusted(widenedContext, maintainer)).toBe(true)
+    expect(RepoCore.isTrusted(widenedContext, foreign)).toBe(false)
+    expect(
+      RepoCore.selectAuthorizedRepoStateEvent(widenedContext, [
+        state({id: "4".repeat(64), pubkey: foreign, created_at: 5}),
+      ]),
+    ).toBeUndefined()
+  })
 })

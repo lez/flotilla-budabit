@@ -60,19 +60,22 @@ function normalizeAuthorityPubkey(value?: string): string {
 }
 
 function getOwnerPubkey(ctx: RepoContext): string {
+  const announcedOwner = normalizeAuthorityPubkey(ctx.repoEvent?.pubkey)
+  if (announcedOwner) return announcedOwner
   const owner = ctx.repo?.owner?.trim?.() ?? ""
   if (owner) return normalizeAuthorityPubkey(owner)
-  return normalizeAuthorityPubkey(ctx.repoEvent?.pubkey)
+  return ""
 }
 
 function getDirectMaintainers(ctx: RepoContext): string[] {
-  const parsed = ctx.repo?.maintainers || ctx.maintainers || []
   const announced = (ctx.repoEvent?.tags || [])
     .filter(tag => tag[0] === "maintainers")
     .flatMap(tag => tag.slice(1))
-  return Array.from(
-    new Set([...parsed, ...announced].map(normalizeAuthorityPubkey).filter(Boolean)),
-  )
+  if (ctx.repoEvent) {
+    return Array.from(new Set(announced.map(normalizeAuthorityPubkey).filter(Boolean)))
+  }
+  const parsed = ctx.repo?.maintainers || ctx.maintainers || []
+  return Array.from(new Set(parsed.map(normalizeAuthorityPubkey).filter(Boolean)))
 }
 
 function isTrusted(ctx: RepoContext, pubkey?: string): boolean {

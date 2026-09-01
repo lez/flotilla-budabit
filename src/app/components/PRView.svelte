@@ -72,6 +72,7 @@
     GIT_PULL_REQUEST_UPDATE,
     GIT_STATUS_APPLIED,
     isImportedEvent,
+    isTrustedImportedRepoEvent,
     resolveStatusState,
   } from "@nostr-git/core/events"
   import {
@@ -333,7 +334,16 @@
 
   const prStatusEventsArray = $derived.by(() => {
     if (!prStatusEvents) return []
-    return filterVisibleAfterDeletesAndEdits($prStatusEvents as StatusEvent[], $editedTargetIds)
+    return filterVisibleAfterDeletesAndEdits(
+      $prStatusEvents as StatusEvent[],
+      $editedTargetIds,
+    ).filter(status =>
+      isTrustedImportedRepoEvent({
+        event: status,
+        repoOwner: repoOwnerPubkey,
+        maintainers: repoMaintainerPubkeys,
+      }),
+    )
   })
 
   const prResolvedStatus = $derived.by(() => {
@@ -2781,13 +2791,13 @@
   const matchesCurrentDeliveryContext = (identity: PrDeliveryIdentity) =>
     Boolean(
       prEvent &&
-        $pubkey &&
-        identity.rootId === prEvent.id &&
-        identity.tipOid === prEffectiveTipOid &&
-        identity.targetBranch === prTargetBranch &&
-        identity.announcementId === String((repoClass as any)?.repoEvent?.id || "") &&
-        identity.primaryUrl === primaryTargetCloneUrl &&
-        identity.actor === $pubkey,
+      $pubkey &&
+      identity.rootId === prEvent.id &&
+      identity.tipOid === prEffectiveTipOid &&
+      identity.targetBranch === prTargetBranch &&
+      identity.announcementId === String((repoClass as any)?.repoEvent?.id || "") &&
+      identity.primaryUrl === primaryTargetCloneUrl &&
+      identity.actor === $pubkey,
     )
 
   const getCurrentDeliveryKey = (mergeOid: string) => {
@@ -2820,7 +2830,11 @@
 
   const clearPrDelivery = () => {
     if (prEvent && typeof localStorage !== "undefined") {
-      clearPrDeliveryRecovery(localStorage, prEvent.id, $pubkey || mergePrDeliveryIdentity?.actor || "")
+      clearPrDeliveryRecovery(
+        localStorage,
+        prEvent.id,
+        $pubkey || mergePrDeliveryIdentity?.actor || "",
+      )
     }
     mergePrDeliveryGeneration++
     mergePrDeliveryIdentity = null
