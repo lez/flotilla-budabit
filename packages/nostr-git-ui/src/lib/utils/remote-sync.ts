@@ -47,16 +47,16 @@ import {
 } from "./worker-operation-session.js";
 
 export interface RemoteSyncRef {
-  type: "heads" | "tags";
+  type: "heads" | "tags" | "nostr";
   name: string;
   ref: string;
   commit?: string;
 }
 
 export type RemoteRefObservation =
-  | {status: "confirmed"; refs: string[]}
-  | {status: "diverged"; refs: string[]}
-  | {status: "unknown"; error: unknown}
+  | { status: "confirmed"; refs: string[] }
+  | { status: "diverged"; refs: string[] }
+  | { status: "unknown"; error: unknown };
 
 export type RemoteSyncTargetStage =
   | "planned"
@@ -817,17 +817,20 @@ export async function inspectRequestedRemoteRefs(params: {
   refs: RemoteSyncRef[];
 }): Promise<RemoteRefObservation> {
   if (!params.workerApi?.listServerRefs) {
-    return {status: "unknown", error: new Error("Remote ref postflight verification is unavailable")};
+    return {
+      status: "unknown",
+      error: new Error("Remote ref postflight verification is unavailable"),
+    };
   }
 
-  let advertisedRefs: Array<{ref?: string; oid?: string}>;
+  let advertisedRefs: Array<{ ref?: string; oid?: string }>;
   try {
     advertisedRefs = (await params.workerApi.listServerRefs({
       url: params.remoteUrl,
       symrefs: true,
-    })) as Array<{ref?: string; oid?: string}>;
+    })) as Array<{ ref?: string; oid?: string }>;
   } catch (error) {
-    return {status: "unknown", error};
+    return { status: "unknown", error };
   }
   const advertisedByRef = new Map(
     (advertisedRefs || []).map((ref) => [String(ref.ref || ""), String(ref.oid || "")])
@@ -839,10 +842,10 @@ export async function inspectRequestedRemoteRefs(params: {
   });
 
   if (mismatches.length > 0) {
-    return {status: "diverged", refs: mismatches.map((ref) => ref.ref)};
+    return { status: "diverged", refs: mismatches.map((ref) => ref.ref) };
   }
 
-  return {status: "confirmed", refs: params.refs.map((ref) => ref.ref)};
+  return { status: "confirmed", refs: params.refs.map((ref) => ref.ref) };
 }
 
 export async function verifyRequestedRemoteRefs(params: {

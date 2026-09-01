@@ -3,6 +3,13 @@ export * from "./vendor-providers.js"
 
 export * from "./config.js"
 export {
+  buildImportedCollaborationInventory,
+  reconcileImportedCollaboration,
+  type ImportedCollaborationAction,
+  type ImportedCollaborationInventory,
+  type ImportedCommentInput,
+} from "./imported-collaboration.js"
+export {
   readCommitInfo as getDetailedCommitInfo,
   getAllBranches,
   hasOutstandingChanges,

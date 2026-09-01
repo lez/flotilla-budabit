@@ -9,6 +9,7 @@ import {
 const bridgeTags = [
   ["proxy", "https://github.com/nostr-protocol/nips/pull/1", "github"],
   ["source-author", "contributor", "https://github.com/contributor"],
+  ["source-key", "github:pull-request:1"],
   ["imported", ""],
   ["original_date", "1700000000"],
   ["original_updated_at", "1700000100"],

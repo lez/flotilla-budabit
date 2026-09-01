@@ -69,6 +69,7 @@ describe("platform-to-nostr pull requests", () => {
       "github",
     ])
     expect(converted.event.tags).toContainEqual(["source-author", "alice", ""])
+    expect(converted.event.tags).toContainEqual(["source-key", "github:pull-request:42"])
     expect(converted.event.tags).toContainEqual(["original_updated_at", "1767225600"])
   })
 })

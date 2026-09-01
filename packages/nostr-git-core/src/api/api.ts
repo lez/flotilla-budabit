@@ -185,6 +185,7 @@ export interface PullRequest {
   }
   mergeable?: boolean
   merged: boolean
+  draft?: boolean
   mergedAt?: string
   createdAt: string
   updatedAt: string

@@ -22,11 +22,23 @@ import {
   convertCommentsToNostrEvents,
   convertPullRequestsToNostrEvents,
   getPlatformSource,
-  signEvent,
+  importedBridgeTags,
+  buildImportedCollaborationInventory,
+  type ImportedCollaborationInventory,
   type UserProfileMap,
   type CommentEventMap,
 } from "@nostr-git/core";
-import { GIT_ISSUE, GIT_PULL_REQUEST } from "@nostr-git/core/events";
+import {
+  GIT_ISSUE,
+  GIT_PULL_REQUEST,
+  GIT_PULL_REQUEST_UPDATE,
+  GIT_STATUS_APPLIED,
+  GIT_STATUS_CLOSED,
+  GIT_STATUS_DRAFT,
+  GIT_STATUS_OPEN,
+  createPullRequestUpdateEvent,
+  createStatusEvent,
+} from "@nostr-git/core/events";
 import { parseRepoId } from "@nostr-git/core/utils";
 import type {
   RepoAnnouncementEvent,
@@ -49,12 +61,14 @@ import {
   getImportedRepoRelayUrls,
   getImportedRepoName,
 } from "../utils/import-repo-metadata.js";
+import { signTrustedImportedEvent } from "../utils/imported-collaboration-delivery.js";
 import {
   applyReconciledGraspResults,
   assertCompleteRemoteRefPush,
   getRemoteSyncProvisionalEvents,
   publishRepoSyncAnnouncement,
   syncLocalRepoToTargets,
+  verifyRequestedRemoteRefs,
   type RemoteSyncRef,
   type RemoteSyncTargetResult,
 } from "../utils/remote-sync.js";
@@ -252,6 +266,7 @@ export interface UseImportRepoOptions {
     relays: string[];
     filters: NostrFilter[];
     timeoutMs?: number;
+    throwOnTimeout?: boolean;
   }) => Promise<NostrEvent[]>;
 
   /**
@@ -334,6 +349,7 @@ interface ImportContext {
   issueEventIdMap: Map<number, string>; // issue.number -> nostr event ID
   prEventIdMap: Map<number, string>; // pr.number -> nostr event ID
   commentEventMap: Map<string, string>; // platformCommentId -> nostr event ID (for threading)
+  collaborationInventory?: ImportedCollaborationInventory;
 
   // Running counters
   issuesPublished: number;
@@ -359,6 +375,7 @@ interface ImportContext {
     relays: string[];
     filters: NostrFilter[];
     timeoutMs?: number;
+    throwOnTimeout?: boolean;
   }) => Promise<NostrEvent[]>;
 
   // Worker API for remote sync
@@ -379,6 +396,57 @@ interface ImportContext {
 }
 
 // ===== Batch Publishing Functions =====
+
+async function signImportedEvent(
+  context: ImportContext,
+  event: Omit<NostrEvent, "id" | "sig" | "pubkey">
+): Promise<NostrEvent> {
+  if (!context.onSignEvent) {
+    throw new Error("Trusted forge imports require the active Nostr signer");
+  }
+  return signTrustedImportedEvent({
+    event,
+    expectedSigner: context.userPubkey,
+    trustedPubkeys: [context.userPubkey],
+    signEvent: context.onSignEvent,
+  });
+}
+
+async function loadCollaborationInventory(context: ImportContext): Promise<void> {
+  if (!context.onFetchRelayEvents || context.relayUrls.length === 0) return;
+  const events = await context.onFetchRelayEvents({
+    relays: context.relayUrls,
+    filters: [
+      {
+        kinds: [GIT_ISSUE, GIT_PULL_REQUEST, GIT_PULL_REQUEST_UPDATE, 1630, 1631, 1632, 1633],
+        "#a": [context.repoAddr],
+      },
+      { kinds: [1111], "#q": [context.repoAddr] },
+    ],
+    timeoutMs: 15000,
+    throwOnTimeout: true,
+  });
+  context.collaborationInventory = buildImportedCollaborationInventory({
+    events,
+    repoAddr: context.repoAddr,
+    repoOwner: context.userPubkey,
+    maintainers: [],
+  });
+  for (const [sourceKey, event] of context.collaborationInventory.commentsBySourceKey) {
+    context.commentEventMap.set(sourceKey, event.id);
+  }
+  for (const event of context.collaborationInventory.rootsBySourceKey.values()) {
+    const proxyUrl = event.tags.find((tag) => tag[0] === "proxy")?.[1] || "";
+    const issueNumber = Number(proxyUrl.match(/\/issues\/(\d+)/)?.[1] || 0);
+    const pullRequestNumber = Number(proxyUrl.match(/\/pull\/(\d+)/)?.[1] || 0);
+    if (event.kind === GIT_ISSUE && issueNumber) {
+      context.issueEventIdMap.set(issueNumber, event.id);
+    }
+    if (event.kind === GIT_PULL_REQUEST && pullRequestNumber) {
+      context.prEventIdMap.set(pullRequestNumber, event.id);
+    }
+  }
+}
 
 /**
  * Publish a single event using batched publishing
@@ -407,7 +475,9 @@ async function flushEventQueue(context: ImportContext): Promise<void> {
   );
 
   const publishOne = async (event: NostrEvent): Promise<void> => {
-    if (!context.onPublishEvent) return;
+    if (!context.onPublishEvent) {
+      throw new Error("Imported event publisher is unavailable");
+    }
 
     const isProfileEvent = event.kind === 0;
     const result = await context.onPublishEvent(
@@ -417,14 +487,14 @@ async function flushEventQueue(context: ImportContext): Promise<void> {
     if (isProfileEvent) return;
 
     const ack = extractPublishRelayAck(result);
-    if (!ack.hasRelayOutcomes || ack.successCount > 0) return;
+    if (ack.hasRelayOutcomes && ack.successCount > 0) return;
 
     const details =
       ack.relayOutcomes
         ?.map((outcome) => `${outcome.relay}: ${outcome.detail || outcome.status}`)
         .join("; ") || ack.failedRelays.join(", ");
     throw new Error(
-      `No repository relay ACKed imported event ${event.id}${details ? ` (${details})` : ""}`
+      `No repository relay explicitly ACKed imported event ${event.id}${details ? ` (${details})` : ""}`
     );
   };
 
@@ -616,6 +686,7 @@ async function initializeImportContext(
     relays: string[];
     filters: NostrFilter[];
     timeoutMs?: number;
+    throwOnTimeout?: boolean;
   }) => Promise<NostrEvent[]>
 ): Promise<Partial<ImportContext>> {
   updateProgress("Parsing repository URL...");
@@ -1019,6 +1090,17 @@ const isCreatedOrUpdatedSince = (
   return new Date(item.createdAt) >= sinceDate || new Date(item.updatedAt) >= sinceDate;
 };
 
+const getCommentSource = (context: ImportContext, comment: Comment) =>
+  getPlatformSource(
+    comment,
+    context.platform,
+    comment.kind === "inline"
+      ? "pull-request-review-comment"
+      : comment.kind === "review"
+        ? "pull-request-review"
+        : "issue-comment"
+  );
+
 /**
  * Fetch and publish issues in streaming fashion (page-by-page)
  * Processes and publishes each issue immediately, keeping only ID mappings in memory
@@ -1069,40 +1151,41 @@ async function fetchAndPublishIssuesStreaming(
         await ensureUserProfile(context, issue.closedBy.login, issue.closedBy.avatarUrl);
       }
 
-      // Convert single issue to Nostr event
-      const issueEventData = convertIssuesToNostrEvents(
-        [issue], // Single issue
-        context.repoAddr,
-        context.platform,
-        context.userProfiles,
-        context.importTimestamp,
-        context.currentTimestamp
-      );
-
-      if (issueEventData.length > 0) {
+      const source = getPlatformSource(issue, context.platform, "issue");
+      const existingRoot =
+        context.collaborationInventory?.rootsBySourceKey.get(source.sourceKey) ||
+        context.collaborationInventory?.rootsByProxy.get(`${source.provider}:${source.proxyUrl}`);
+      let signedIssueEvent = existingRoot;
+      if (!signedIssueEvent) {
+        const issueEventData = convertIssuesToNostrEvents(
+          [issue],
+          context.repoAddr,
+          context.platform,
+          context.userProfiles,
+          context.importTimestamp,
+          context.currentTimestamp
+        );
+        if (issueEventData.length === 0) continue;
         const [eventData] = issueEventData;
-
-        // Add p-tag for bridged Nostr identity (NIP-39) when match found
         addBridgedPTags(
           eventData.event,
           context.platform,
           issue.author.login,
           context.bridgedNostrPubkeys
         );
-
-        // Sign issue event
-        const signedIssueEvent = signEvent(eventData.event, eventData.privkey);
-
-        // Publish issue event (batched)
+        signedIssueEvent = await signImportedEvent(context, eventData.event);
         await publishEventBatched(context, signedIssueEvent);
-
-        // Store only ID mapping (lightweight)
-        context.issueEventIdMap.set(issue.number, signedIssueEvent.id);
         context.currentTimestamp += 1;
         totalIssues++;
         context.issuesPublished = totalIssues;
+      }
+      context.issueEventIdMap.set(issue.number, signedIssueEvent.id);
 
-        // Generate and publish status events immediately
+      const desiredStatusKind = issue.state === "closed" ? GIT_STATUS_CLOSED : GIT_STATUS_OPEN;
+      if (
+        context.collaborationInventory?.statusesBySourceKey.get(source.sourceKey)?.kind !==
+        desiredStatusKind
+      ) {
         const originalDate =
           issue.state === "open" ? issue.createdAt : (issue.closedAt ?? issue.createdAt);
         const statusEvent = convertIssueStatusToEvent(
@@ -1112,35 +1195,18 @@ async function fetchAndPublishIssuesStreaming(
           context.repoAddr,
           context.currentTimestamp,
           {
-            source: getPlatformSource(issue, context.platform, "issue"),
+            source,
             author: issue.state === "open" ? issue.author : issue.closedBy || issue.author,
             updatedAt: issue.updatedAt,
           }
         );
-
         context.abortController.throwIfAborted();
-
-        // Sign status event with the profile of the user who created or closed the issue
-        const signerUser = issue.state === "open" ? issue.author : issue.closedBy || issue.author;
-
-        const signerProfileKey = getProfileMapKey(context.platform, signerUser.login);
-        const signerProfile = context.userProfiles.get(signerProfileKey);
-        if (!signerProfile) {
-          throw new Error(
-            `Missing profile for issue ${issue.state === "open" ? "creator" : "closer"} ${signerUser.login}; cannot sign status event for issue #${issue.number}`
-          );
-        }
-        const signedStatusEvent = signEvent(statusEvent, signerProfile.privkey);
-
-        // Publish status event (batched)
+        const signedStatusEvent = await signImportedEvent(context, statusEvent);
         await publishEventBatched(context, signedStatusEvent);
-
         context.currentTimestamp += 1;
         statusEventsPublished++;
-
-        // Update progress with count of published issues
-        context.updateProgress(`Publishing issues... (${totalIssues} published)`, totalIssues);
       }
+      context.updateProgress(`Publishing issues... (${totalIssues} published)`, totalIssues);
     }
 
     page++;
@@ -1174,7 +1240,9 @@ async function pushImportedPullRequestRefs(
   const graspTargets = context.remotePushResults.filter(
     (result) => result.success && result.provider === "grasp" && result.remoteUrl
   );
-  if (graspTargets.length === 0) return;
+  if (graspTargets.length === 0) {
+    throw new Error("Imported pull requests require a verified GRASP target");
+  }
   if (!context.workerApi?.materializeNostrRef || !context.workerApi?.pushToRemote) {
     throw new Error("Git worker cannot prepare imported pull request refs for GRASP");
   }
@@ -1221,6 +1289,16 @@ async function pushImportedPullRequestRefs(
       0
     );
     assertCompleteRemoteRefPush(pushResult, refs, target.label);
+    await verifyRequestedRemoteRefs({
+      workerApi: context.workerApi,
+      remoteUrl: target.remoteUrl,
+      refs: pullRequestRefs.map((item) => ({
+        type: "nostr" as const,
+        name: item.eventId,
+        ref: `refs/nostr/${item.eventId}`,
+        commit: item.commit,
+      })),
+    });
   }
 }
 
@@ -1235,7 +1313,6 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
   let page = 1;
   const perPage = 100;
   let totalPRs = 0;
-  let pendingGraspRefs: ImportedPullRequestRef[] = [];
 
   while (true) {
     context.abortController.throwIfAborted();
@@ -1296,59 +1373,113 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
         }
       }
 
-      // Convert single PR to Nostr event (with title, body, branch, base, labels, commits)
-      const prEventData = convertPullRequestsToNostrEvents(
-        [pr], // Single PR
-        context.repoAddr,
-        context.platform,
-        context.userProfiles,
-        context.importTimestamp,
-        context.currentTimestamp,
-        prCommits
-      );
-
-      if (prEventData.length > 0) {
+      const source = getPlatformSource(pr, context.platform, "pull-request");
+      const existingRoot =
+        context.collaborationInventory?.rootsBySourceKey.get(source.sourceKey) ||
+        context.collaborationInventory?.rootsByProxy.get(`${source.provider}:${source.proxyUrl}`);
+      let rootEvent = existingRoot;
+      if (!rootEvent) {
+        const prEventData = convertPullRequestsToNostrEvents(
+          [pr],
+          context.repoAddr,
+          context.platform,
+          context.userProfiles,
+          context.importTimestamp,
+          context.currentTimestamp,
+          prCommits
+        );
+        if (prEventData.length === 0) continue;
         const [eventData] = prEventData;
-
-        // Add p-tag for bridged Nostr identity (NIP-39) when match found
         addBridgedPTags(
           eventData.event,
           context.platform,
           pr.author.login,
           context.bridgedNostrPubkeys
         );
-
-        // Sign PR event
-        const signedPrEvent = signEvent(eventData.event, eventData.privkey);
-
-        // Store PR event ID for comment linking
-        context.prEventIdMap.set(pr.number, signedPrEvent.id);
-
-        const tipCommit = signedPrEvent.tags.find((tag) => tag[0] === "c")?.[1];
+        rootEvent = await signImportedEvent(context, eventData.event);
+        const tipCommit = rootEvent.tags.find((tag) => tag[0] === "c")?.[1];
         if (!tipCommit) {
           throw new Error(`Imported PR #${pr.number} has no tip commit`);
         }
-
-        context.eventQueue.push(signedPrEvent);
-        pendingGraspRefs.push({
-          eventId: signedPrEvent.id,
-          commit: tipCommit,
-          sourceRef: getPullRequestSourceRef(context.platform, eventData.platformPullRequestNumber),
-        });
-
-        if (context.eventQueue.length >= context.batchSize) {
-          await flushEventQueue(context);
-          await pushImportedPullRequestRefs(context, pendingGraspRefs);
-          pendingGraspRefs = [];
-        }
-
+        await pushImportedPullRequestRefs(context, [
+          {
+            eventId: rootEvent.id,
+            commit: tipCommit,
+            sourceRef: getPullRequestSourceRef(
+              context.platform,
+              eventData.platformPullRequestNumber
+            ),
+          },
+        ]);
+        await publishEventBatched(context, rootEvent);
         context.currentTimestamp += 1;
         totalPRs++;
         context.prsPublished = totalPRs;
-
-        // Update progress with count of published PRs
-        context.updateProgress(`Publishing PRs... (${totalPRs} published)`, totalPRs);
       }
+      context.prEventIdMap.set(pr.number, rootEvent.id);
+
+      const latestUpdate = context.collaborationInventory?.updatesBySourceKey.get(source.sourceKey);
+      const knownTip = (latestUpdate || rootEvent).tags.find((tag) => tag[0] === "c")?.[1];
+      if (existingRoot && knownTip !== pr.head.sha) {
+        const update = createPullRequestUpdateEvent({
+          repoAddr: context.repoAddr,
+          pullRequestEventId: rootEvent.id,
+          pullRequestAuthorPubkey: rootEvent.pubkey,
+          tipCommitOid: pr.head.sha,
+          clone: context.sourceCloneUrls,
+          mergeBase: pr.base.sha,
+          tags: importedBridgeTags({
+            source,
+            author: pr.author,
+            createdAt: pr.createdAt,
+            updatedAt: pr.updatedAt,
+          }) as any,
+          created_at: context.currentTimestamp,
+        });
+        const signedUpdate = await signImportedEvent(context, update);
+        await pushImportedPullRequestRefs(context, [
+          {
+            eventId: signedUpdate.id,
+            commit: pr.head.sha,
+            sourceRef: getPullRequestSourceRef(context.platform, pr.number),
+          },
+        ]);
+        await publishEventBatched(context, signedUpdate);
+        context.currentTimestamp += 1;
+      }
+
+      const desiredStatus =
+        pr.merged || pr.state === "merged"
+          ? GIT_STATUS_APPLIED
+          : pr.draft
+            ? GIT_STATUS_DRAFT
+            : pr.state === "closed"
+              ? GIT_STATUS_CLOSED
+              : GIT_STATUS_OPEN;
+      if (
+        context.collaborationInventory?.statusesBySourceKey.get(source.sourceKey)?.kind !==
+        desiredStatus
+      ) {
+        const status = createStatusEvent({
+          kind: desiredStatus,
+          content: "",
+          rootId: rootEvent.id,
+          recipients: [rootEvent.pubkey],
+          repoAddr: context.repoAddr,
+          appliedCommits: desiredStatus === GIT_STATUS_APPLIED ? [pr.head.sha] : undefined,
+          mergedCommit: desiredStatus === GIT_STATUS_APPLIED ? pr.head.sha : undefined,
+          tags: importedBridgeTags({
+            source,
+            author: pr.author,
+            createdAt: pr.createdAt,
+            updatedAt: pr.updatedAt,
+          }) as any,
+          created_at: context.currentTimestamp,
+        });
+        await publishEventBatched(context, await signImportedEvent(context, status));
+        context.currentTimestamp += 1;
+      }
+      context.updateProgress(`Publishing PRs... (${totalPRs} published)`, totalPRs);
     }
 
     // Check if we should continue
@@ -1368,7 +1499,6 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
 
   // Flush any remaining events in the queue
   await flushEventQueue(context);
-  await pushImportedPullRequestRefs(context, pendingGraspRefs);
 
   return totalPRs;
 }
@@ -1392,7 +1522,46 @@ async function fetchAndPublishCommentsStreaming(
   // Check if the API supports bulk comment fetching
   const apiWithBulkComments = context.api;
   let totalCommentsPublished = 0;
-  const commentEventMap: CommentEventMap = new Map(); // For threading within each issue/PR
+  const commentEventMap: CommentEventMap = new Map(context.commentEventMap);
+
+  const publishPullRequestComment = async (comment: Comment, prNumber: number) => {
+    if (!isCreatedOrUpdatedSince(comment, context.config.sinceDate)) return;
+    const prEventId = context.prEventIdMap.get(prNumber);
+    if (!prEventId) return;
+    const source = getCommentSource(context, comment);
+    const existing =
+      context.collaborationInventory?.commentsBySourceKey.get(source.sourceKey) ||
+      context.collaborationInventory?.commentsByProxy.get(`${source.provider}:${source.proxyUrl}`);
+    if (existing) {
+      commentEventMap.set(source.sourceKey, existing.id);
+      return;
+    }
+    if (comment.inReplyToSourceKey && !commentEventMap.has(comment.inReplyToSourceKey)) return;
+    await ensureUserProfile(context, comment.author.login, comment.author.avatarUrl);
+    const [converted] = convertCommentsToNostrEvents(
+      [comment],
+      prEventId,
+      context.platform,
+      context.userProfiles,
+      commentEventMap,
+      context.importTimestamp,
+      context.currentTimestamp,
+      { rootKind: GIT_PULL_REQUEST, repoAddr: context.repoAddr }
+    );
+    if (!converted) return;
+    addBridgedPTags(
+      converted.event,
+      context.platform,
+      comment.author.login,
+      context.bridgedNostrPubkeys
+    );
+    const signed = await signImportedEvent(context, converted.event);
+    await publishEventBatched(context, signed);
+    commentEventMap.set(converted.platformCommentKey, signed.id);
+    context.currentTimestamp += 1;
+    totalCommentsPublished += 1;
+    context.commentsPublished = totalCommentsPublished;
+  };
 
   if (apiWithBulkComments.listAllIssueComments) {
     // Use bulk endpoint if available
@@ -1425,6 +1594,16 @@ async function fetchAndPublishCommentsStreaming(
       // Process and publish each comment immediately
       for (const comment of filteredComments) {
         context.abortController.throwIfAborted();
+        const source = getCommentSource(context, comment);
+        const existing =
+          context.collaborationInventory?.commentsBySourceKey.get(source.sourceKey) ||
+          context.collaborationInventory?.commentsByProxy.get(
+            `${source.provider}:${source.proxyUrl}`
+          );
+        if (existing) {
+          commentEventMap.set(source.sourceKey, existing.id);
+          continue;
+        }
 
         // Determine if this is a PR comment or issue comment
         const isPrComment = prNumbers.has(comment.issueNumber);
@@ -1477,7 +1656,7 @@ async function fetchAndPublishCommentsStreaming(
           );
 
           // Sign comment event
-          const signedCommentEvent = signEvent(convertedComment.event, convertedComment.privkey);
+          const signedCommentEvent = await signImportedEvent(context, convertedComment.event);
 
           // Publish comment event (batched)
           await publishEventBatched(context, signedCommentEvent);
@@ -1539,6 +1718,16 @@ async function fetchAndPublishCommentsStreaming(
         // Filter and publish each comment
         for (const comment of pageComments) {
           if (!isCreatedOrUpdatedSince(comment, context.config.sinceDate)) continue;
+          const source = getCommentSource(context, comment);
+          const existing =
+            context.collaborationInventory?.commentsBySourceKey.get(source.sourceKey) ||
+            context.collaborationInventory?.commentsByProxy.get(
+              `${source.provider}:${source.proxyUrl}`
+            );
+          if (existing) {
+            commentEventMap.set(source.sourceKey, existing.id);
+            continue;
+          }
 
           await ensureUserProfile(context, comment.author.login, comment.author.avatarUrl);
 
@@ -1563,7 +1752,7 @@ async function fetchAndPublishCommentsStreaming(
               context.bridgedNostrPubkeys
             );
 
-            const signedCommentEvent = signEvent(convertedComment.event, convertedComment.privkey);
+            const signedCommentEvent = await signImportedEvent(context, convertedComment.event);
 
             // Publish comment event (batched)
             await publishEventBatched(context, signedCommentEvent);
@@ -1581,9 +1770,6 @@ async function fetchAndPublishCommentsStreaming(
 
         commentPage++;
       }
-
-      // Clear commentEventMap after each issue to free memory
-      commentEventMap.clear();
     }
 
     // Similar for PRs
@@ -1616,6 +1802,16 @@ async function fetchAndPublishCommentsStreaming(
 
         for (const comment of pageComments) {
           if (!isCreatedOrUpdatedSince(comment, context.config.sinceDate)) continue;
+          const source = getCommentSource(context, comment);
+          const existing =
+            context.collaborationInventory?.commentsBySourceKey.get(source.sourceKey) ||
+            context.collaborationInventory?.commentsByProxy.get(
+              `${source.provider}:${source.proxyUrl}`
+            );
+          if (existing) {
+            commentEventMap.set(source.sourceKey, existing.id);
+            continue;
+          }
 
           await ensureUserProfile(context, comment.author.login, comment.author.avatarUrl);
 
@@ -1640,7 +1836,7 @@ async function fetchAndPublishCommentsStreaming(
               context.bridgedNostrPubkeys
             );
 
-            const signedCommentEvent = signEvent(convertedComment.event, convertedComment.privkey);
+            const signedCommentEvent = await signImportedEvent(context, convertedComment.event);
 
             // Publish comment event (batched)
             await publishEventBatched(context, signedCommentEvent);
@@ -1658,13 +1854,52 @@ async function fetchAndPublishCommentsStreaming(
 
         commentPage++;
       }
-
-      commentEventMap.clear();
     }
 
     // Flush any remaining events in the queue after fallback comment fetching
     await flushEventQueue(context);
   }
+
+  if (context.api.listAllPullRequestReviewComments) {
+    let page = 1;
+    while (true) {
+      const comments = await context.withRateLimit(context.platform, "GET", () =>
+        context.api.listAllPullRequestReviewComments!(context.parsed.owner, context.parsed.repo, {
+          page,
+          per_page: 100,
+          since: context.config.sinceDate?.toISOString(),
+        })
+      );
+      for (const comment of comments.sort(
+        (a, b) =>
+          a.createdAt.localeCompare(b.createdAt) ||
+          a.source!.sourceKey.localeCompare(b.source!.sourceKey)
+      )) {
+        await publishPullRequestComment(comment, comment.pullRequestNumber);
+      }
+      if (comments.length < 100) break;
+      page += 1;
+    }
+  }
+
+  if (context.api.listPullRequestReviews) {
+    for (const prNumber of prNumbers) {
+      let page = 1;
+      while (true) {
+        const reviews = await context.withRateLimit(context.platform, "GET", () =>
+          context.api.listPullRequestReviews!(context.parsed.owner, context.parsed.repo, prNumber, {
+            page,
+            per_page: 100,
+          })
+        );
+        for (const review of reviews) await publishPullRequestComment(review, prNumber);
+        if (reviews.length < 100) break;
+        page += 1;
+      }
+    }
+  }
+
+  await flushEventQueue(context);
 
   return totalCommentsPublished;
 }
@@ -2591,6 +2826,7 @@ export function useImportRepo(options: UseImportRepoOptions) {
       signedRepoAnnouncement = publishedRepoEvents.announcement;
       signedRepoState = publishedRepoEvents.state;
       repoMetadataPublished = true;
+      await loadCollaborationInventory(context);
 
       // Step 2: Stream issues (fetch, process, publish immediately)
       let issuesImported = 0;

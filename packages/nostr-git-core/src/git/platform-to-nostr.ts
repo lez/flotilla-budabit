@@ -78,6 +78,7 @@ export const importedBridgeTags = ({
   return [
     ["proxy", source.proxyUrl, source.provider],
     ["source-author", author.login || "ghost", author.htmlUrl || ""],
+    ["source-key", source.sourceKey],
     ["imported", ""],
     ["original_date", String(originalDate)],
     ["original_updated_at", String(originalUpdatedAt)],

@@ -42,6 +42,7 @@ export type CommentTag =
   | ["repo", string]
   | ["proxy", string, string]
   | ["source-author", string, string]
+  | ["source-key", string]
   | ["imported", string]
   | ["original_date", string]
   | ["original_updated_at", string]

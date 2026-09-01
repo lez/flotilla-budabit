@@ -69,10 +69,15 @@ export {
   convertPullRequestsToNostrEvents,
   getPlatformSource,
   importedBridgeTags,
+  buildImportedCollaborationInventory,
+  reconcileImportedCollaboration,
   signEvent,
   type UserProfileMap,
   type CommentEventMap,
   type ConvertedComment,
+  type ImportedCollaborationAction,
+  type ImportedCollaborationInventory,
+  type ImportedCommentInput,
 } from "./git/index.js"
 
 export {getGitServiceApi, getGitServiceApiFromUrl} from "./git/provider-factory.js"

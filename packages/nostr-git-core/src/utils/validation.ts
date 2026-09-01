@@ -78,12 +78,14 @@ export const QReferenceTag = z.tuple([z.literal("q"), z.string()]).rest(z.string
 export const ImetaTag = z.tuple([z.literal("imeta")]).rest(z.string())
 export const ProxyTag = z.tuple([z.literal("proxy"), z.string(), z.string()])
 export const SourceAuthorTag = z.tuple([z.literal("source-author"), z.string(), z.string()])
+export const SourceKeyTag = z.tuple([z.literal("source-key"), z.string().min(1)])
 export const ImportedTag = z.tuple([z.literal("imported"), z.string()])
 export const OriginalDateTag = z.tuple([z.literal("original_date"), z.string()])
 export const OriginalUpdatedAtTag = z.tuple([z.literal("original_updated_at"), z.string()])
 const ImportedBridgeTagSchemas = [
   ProxyTag,
   SourceAuthorTag,
+  SourceKeyTag,
   ImportedTag,
   OriginalDateTag,
   OriginalUpdatedAtTag,
