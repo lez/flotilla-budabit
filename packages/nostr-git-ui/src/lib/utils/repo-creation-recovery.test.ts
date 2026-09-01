@@ -1,4 +1,5 @@
-import { nip19 } from "nostr-tools";
+import { finalizeEvent, nip19 } from "nostr-tools";
+import { hexToBytes } from "nostr-tools/utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { recoverRepoCreationRecord } from "./repo-creation-recovery.js";
@@ -6,7 +7,7 @@ import type { RepoCreationRecoveryRecord } from "./repo-creation-transaction.js"
 
 function record(overrides: Partial<RepoCreationRecoveryRecord> = {}): RepoCreationRecoveryRecord {
   return {
-    version: 2,
+    version: 3,
     id: "new:owner/repo:1",
     operation: "new",
     ownerPubkey: "a".repeat(64),
@@ -18,6 +19,7 @@ function record(overrides: Partial<RepoCreationRecoveryRecord> = {}): RepoCreati
     targetResults: [],
     publishedEvents: [],
     eventAcks: [],
+    collaboration: { status: "not-requested", phase: "inventory", cursors: {} },
     pendingCompensations: [],
     cleanup: { stage: "not-needed", manualAttention: false },
     manualAttention: { required: false },
@@ -41,8 +43,139 @@ function storage() {
   } as Storage;
 }
 
+function collaborationEvent(kind: number, tags: string[][] = []) {
+  return finalizeEvent({ kind, created_at: 1, content: "", tags }, hexToBytes("1".repeat(64)));
+}
+
 describe("repository creation recovery", () => {
   beforeEach(() => vi.stubGlobal("localStorage", storage()));
+
+  it("reconciles an already accepted exact collaboration event without republishing", async () => {
+    const event = collaborationEvent(1621, [["source-key", "github:issue:1"]]);
+    const publisher = vi.fn();
+    const result = await recoverRepoCreationRecord(
+      record({
+        operation: "import",
+        phase: "collaboration-pending",
+        collaboration: {
+          status: "pending",
+          phase: "issues",
+          cursors: { issues: 1 },
+          pendingEvent: {
+            sourceKey: "github:issue:1",
+            event,
+            canonicalRelayUrls: ["wss://canonical.example/"],
+            relayOutcomes: [],
+            recordedAt: 1,
+          },
+        },
+      }),
+      {
+        workerApi: {},
+        publisher,
+        fetchRelayEvents: vi.fn().mockResolvedValue([event]),
+        onDeleteEvent: vi.fn(),
+      }
+    );
+
+    expect(result.status).toBe("pending");
+    expect(result.record?.collaboration.pendingEvent).toBeUndefined();
+    expect(result.reason).toContain("Resume forge synchronization");
+    expect(publisher).not.toHaveBeenCalled();
+  });
+
+  it("retries the exact event only after its checkpointed PR ref is advertised", async () => {
+    const event = collaborationEvent(1618, [["source-key", "github:pull-request:1"]]);
+    const commit = "c".repeat(40);
+    const publisher = vi.fn().mockResolvedValue({
+      event,
+      ackedRelays: ["wss://canonical.example/"],
+      failedRelays: [],
+      relayOutcomes: [{ relay: "wss://canonical.example/", status: "success", detail: "stored" }],
+    });
+    const result = await recoverRepoCreationRecord(
+      record({
+        operation: "import",
+        phase: "collaboration-pending",
+        targets: [
+          {
+            id: "grasp:one",
+            label: "GRASP",
+            provider: "grasp",
+            stage: "verified",
+            remoteUrl: "https://grasp.example/repo.git",
+            refs: [],
+            cleanup: { stage: "not-needed", manualAttention: false },
+            manualAttention: false,
+            updatedAt: 1,
+          },
+        ],
+        collaboration: {
+          status: "pending",
+          phase: "pull-requests",
+          cursors: { pullRequests: 1 },
+          pendingEvent: {
+            sourceKey: "github:pull-request:1",
+            event,
+            canonicalRelayUrls: ["wss://canonical.example/"],
+            relayOutcomes: [],
+            ref: {
+              ref: `refs/nostr/${event.id}`,
+              commit,
+              targets: [{ targetId: "grasp:one", stage: "verified" }],
+            },
+            recordedAt: 1,
+          },
+        },
+      }),
+      {
+        workerApi: {
+          listServerRefs: vi
+            .fn()
+            .mockResolvedValue([{ ref: `refs/nostr/${event.id}`, oid: commit }]),
+        },
+        publisher,
+        fetchRelayEvents: vi.fn().mockResolvedValue([]),
+        onDeleteEvent: vi.fn(),
+      }
+    );
+
+    expect(result.record?.collaboration.pendingEvent).toBeUndefined();
+    expect(publisher).toHaveBeenCalledWith(event, { relays: ["wss://canonical.example/"] });
+  });
+
+  it("retains an exact pending event when canonical inventory is unknown", async () => {
+    const event = collaborationEvent(1621);
+    const publisher = vi.fn();
+    const result = await recoverRepoCreationRecord(
+      record({
+        phase: "collaboration-pending",
+        collaboration: {
+          status: "pending",
+          phase: "issues",
+          cursors: {},
+          pendingEvent: {
+            sourceKey: "github:issue:1",
+            event,
+            canonicalRelayUrls: ["wss://canonical.example/"],
+            relayOutcomes: [],
+            recordedAt: 1,
+          },
+        },
+      }),
+      {
+        workerApi: {},
+        publisher,
+        fetchRelayEvents: vi.fn().mockRejectedValue(new Error("relay timeout")),
+        onDeleteEvent: vi.fn(),
+      }
+    );
+
+    expect(result.status).toBe("pending");
+    expect(result.record?.collaboration.pendingEvent?.event.id).toBe(event.id);
+    expect(result.reason).toContain("relay timeout");
+    expect(publisher).not.toHaveBeenCalled();
+  });
 
   it("keeps an ambiguous remote without replaying mutations", async () => {
     const createRemoteRepo = vi.fn();

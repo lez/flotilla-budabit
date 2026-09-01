@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { nip19 } from "nostr-tools";
+import { finalizeEvent, nip19 } from "nostr-tools";
+import { hexToBytes } from "nostr-tools/utils";
 
 import {
   getPendingRepoCreationTransactions,
@@ -58,6 +59,106 @@ afterEach(() => {
 });
 
 describe("RepoCreationTransactionJournal", () => {
+  it("persists exact pending collaboration delivery and blocks early completion", () => {
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: new MemoryStorage(),
+    });
+    const journal = new RepoCreationTransactionJournal({
+      id: "import:owner/repo:collaboration",
+      operation: "import",
+      ownerPubkey: "f".repeat(64),
+      repoName: "repo",
+    });
+    const event = finalizeEvent(
+      {
+        kind: 1618,
+        created_at: 1,
+        tags: [["c", "a".repeat(40)]],
+        content: "",
+      },
+      hexToBytes("1".repeat(64))
+    );
+
+    journal.beginCollaboration();
+    journal.recordPendingCollaborationEvent({
+      sourceKey: "github:pull-request:1",
+      event,
+      canonicalRelayUrls: ["wss://relay.example"],
+      ref: {
+        ref: `refs/nostr/${event.id}`,
+        commit: "a".repeat(40),
+        targetIds: ["grasp:one"],
+      },
+    });
+    journal.recordCollaborationRefStage(event.id, "grasp:one", "verified");
+
+    expect(journal.complete()).toBe(false);
+    expect(getPendingRepoCreationTransactions()[0]).toMatchObject({
+      version: 3,
+      phase: "collaboration-pending",
+      collaboration: {
+        status: "pending",
+        pendingEvent: {
+          sourceKey: "github:pull-request:1",
+          event: { id: event.id },
+          ref: { commit: "a".repeat(40), targets: [{ targetId: "grasp:one", stage: "verified" }] },
+        },
+      },
+    });
+  });
+
+  it("clears a pending event only after a canonical relay ACK", () => {
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: new MemoryStorage(),
+    });
+    const journal = new RepoCreationTransactionJournal({
+      id: "import:owner/repo:ack",
+      operation: "import",
+      ownerPubkey: "f".repeat(64),
+      repoName: "repo",
+    });
+    const event = finalizeEvent(
+      {
+        kind: 1621,
+        created_at: 1,
+        tags: [],
+        content: "",
+      },
+      hexToBytes("1".repeat(64))
+    );
+    journal.beginCollaboration();
+    journal.recordPendingCollaborationEvent({
+      sourceKey: "github:issue:1",
+      event,
+      canonicalRelayUrls: ["wss://canonical.example"],
+    });
+
+    expect(
+      journal.recordCollaborationPublishResult(event.id, {
+        event,
+        ackedRelays: ["wss://secondary.example"],
+        failedRelays: ["wss://canonical.example"],
+        relayOutcomes: [
+          { relay: "wss://secondary.example", status: "success", detail: "" },
+          { relay: "wss://canonical.example", status: "failure", detail: "rate-limited" },
+        ],
+      })
+    ).toBe(false);
+    expect(journal.record.collaboration.pendingEvent).toBeDefined();
+
+    expect(
+      journal.recordCollaborationPublishResult(event.id, {
+        event,
+        ackedRelays: ["wss://canonical.example"],
+        failedRelays: [],
+        relayOutcomes: [{ relay: "wss://canonical.example", status: "success", detail: "saved" }],
+      })
+    ).toBe(true);
+    expect(journal.record.collaboration.pendingEvent).toBeUndefined();
+  });
+
   it("rejects credential-bearing relay identities before persisting recovery state", () => {
     Object.defineProperty(globalThis, "localStorage", {
       configurable: true,
@@ -142,7 +243,7 @@ describe("RepoCreationTransactionJournal", () => {
     const [record] = getPendingRepoCreationTransactions();
     expect(record).toEqual(
       expect.objectContaining({
-        version: 2,
+        version: 3,
         phase: "metadata-pending",
         repositoryRelayUrls: ["wss://relay.example/"],
         lastError: "relay timeout",
@@ -247,7 +348,7 @@ describe("RepoCreationTransactionJournal", () => {
 
     expect(record).toEqual(
       expect.objectContaining({
-        version: 2,
+        version: 3,
         id,
         phase: "failed",
         localResource: {
@@ -293,11 +394,18 @@ describe("RepoCreationTransactionJournal", () => {
       "nostr-git:repo-creation:transaction:",
       "nostr-git:repo-creation:v2:"
     );
-    storage.setItem(previousKey, storage.getItem(currentKey) as string);
+    const shippedV2 = JSON.parse(storage.getItem(currentKey) as string);
+    shippedV2.version = 2;
+    delete shippedV2.collaboration;
+    storage.setItem(previousKey, JSON.stringify(shippedV2));
     storage.removeItem(currentKey);
 
     expect(getPendingRepoCreationTransactions()).toEqual([
-      expect.objectContaining({ id: journal.record.id, version: 2 }),
+      expect.objectContaining({
+        id: journal.record.id,
+        version: 3,
+        collaboration: { status: "not-requested", phase: "inventory", cursors: {} },
+      }),
     ]);
     expect(storage.getItem(previousKey)).toBeNull();
     expect(storage.getItem(currentKey)).not.toBeNull();

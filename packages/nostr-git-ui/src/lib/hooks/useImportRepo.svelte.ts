@@ -39,7 +39,7 @@ import {
   createPullRequestUpdateEvent,
   createStatusEvent,
 } from "@nostr-git/core/events";
-import { parseRepoId } from "@nostr-git/core/utils";
+import { normalizeRelayUrl, parseRepoId } from "@nostr-git/core/utils";
 import type {
   RepoAnnouncementEvent,
   RepoStateEvent,
@@ -62,6 +62,11 @@ import {
   getImportedRepoName,
 } from "../utils/import-repo-metadata.js";
 import { signTrustedImportedEvent } from "../utils/imported-collaboration-delivery.js";
+import {
+  drainImportedCollaborationOutbox,
+  enqueueImportedCollaborationReplication,
+  listImportedCollaborationOutbox,
+} from "../utils/imported-collaboration-outbox.js";
 import {
   applyReconciledGraspResults,
   assertCompleteRemoteRefPush,
@@ -222,6 +227,8 @@ export interface ImportResult {
    * Result for each selected remote target push.
    */
   remotePushResults?: ImportRemotePushResult[];
+  canonicalCollaborationComplete: boolean;
+  pendingReplicationCount: number;
 }
 
 export type ImportRemoteProvider = "github" | "gitlab" | "gitea" | "bitbucket" | "grasp";
@@ -302,6 +309,7 @@ export interface UseImportRepoOptions {
    * User's Nostr public key (hex format)
    */
   userPubkey: string;
+  secondaryRelayUrls?: string[];
 }
 
 // ===== Import Context & Types =====
@@ -328,6 +336,8 @@ interface ImportContext {
   finalRepo: RepoMetadata | null;
   repoAddr: string;
   relayUrls: string[];
+  secondaryRelayUrls: string[];
+  pendingReplicationCount: number;
   localRepoId?: string;
   sourceCloneUrls: string[];
 
@@ -480,14 +490,53 @@ async function flushEventQueue(context: ImportContext): Promise<void> {
     }
 
     const isProfileEvent = event.kind === 0;
+    if (!isProfileEvent && !context.creationJournal?.record.collaboration.pendingEvent) {
+      context.creationJournal?.recordPendingCollaborationEvent({
+        sourceKey: event.tags.find((tag) => tag[0] === "source-key")?.[1] || event.id,
+        event,
+        canonicalRelayUrls: relayUrls,
+      });
+    }
     const result = await context.onPublishEvent(
       event,
       !isProfileEvent && relayUrls.length > 0 ? { relays: relayUrls } : undefined
     );
     if (isProfileEvent) return;
 
+    const journalAccepted = context.creationJournal?.recordCollaborationPublishResult(
+      event.id,
+      result
+    );
+
     const ack = extractPublishRelayAck(result);
-    if (ack.hasRelayOutcomes && ack.successCount > 0) return;
+    if (journalAccepted ?? (ack.hasRelayOutcomes && ack.successCount > 0)) {
+      const canonical = new Set(relayUrls.map(normalizeRelayUrl));
+      const secondary = context.secondaryRelayUrls.filter(
+        (relay) => !canonical.has(normalizeRelayUrl(relay))
+      );
+      if (secondary.length > 0) {
+        enqueueImportedCollaborationReplication({
+          transactionId: context.operationId,
+          repoAddress: context.repoAddr,
+          event,
+          relays: secondary,
+        });
+        try {
+          await drainImportedCollaborationOutbox({
+            publisher: context.onPublishEvent,
+            maxItems: secondary.length,
+          });
+          context.pendingReplicationCount = listImportedCollaborationOutbox().filter(
+            (record) => record.repoAddress === context.repoAddr
+          ).length;
+        } catch {
+          context.pendingReplicationCount = listImportedCollaborationOutbox().filter(
+            (record) => record.repoAddress === context.repoAddr
+          ).length;
+        }
+      }
+      return;
+    }
 
     const details =
       ack.relayOutcomes
@@ -498,13 +547,13 @@ async function flushEventQueue(context: ImportContext): Promise<void> {
     );
   };
 
-  const batchTargetsGrasp = batch.some((event) => event.kind !== 0);
-  if (hasSuccessfulGraspTarget && batchTargetsGrasp) {
+  const hasCollaborationEvents = batch.some((event) => event.kind !== 0);
+  if (hasCollaborationEvents) {
     // ngit-grasp permits 60 EVENT messages per minute per connection.
-    const eventDelayMs = Math.max(1250, context.batchDelay);
+    const eventDelayMs = hasSuccessfulGraspTarget ? Math.max(1250, context.batchDelay) : 0;
     for (let index = 0; index < batch.length; index++) {
       await publishOne(batch[index]);
-      if (index < batch.length - 1) {
+      if (eventDelayMs > 0 && index < batch.length - 1) {
         await Promise.race([
           new Promise<void>((resolve) => setTimeout(resolve, eventDelayMs)),
           context.abortController.waitForAbort(),
@@ -1209,6 +1258,8 @@ async function fetchAndPublishIssuesStreaming(
       context.updateProgress(`Publishing issues... (${totalIssues} published)`, totalIssues);
     }
 
+    await flushEventQueue(context);
+    context.creationJournal?.setCollaborationCursor("issues", page);
     page++;
   }
 
@@ -1271,6 +1322,9 @@ async function pushImportedPullRequestRefs(
   const refs = pullRequestRefs.map((item) => `refs/nostr/${item.eventId}`);
   for (const target of graspTargets) {
     context.abortController.throwIfAborted();
+    for (const item of pullRequestRefs) {
+      context.creationJournal?.recordCollaborationRefStage(item.eventId, target.id, "pushing");
+    }
     const pushResult = await runAbortableOperation<any>(
       context.abortController,
       () =>
@@ -1299,6 +1353,9 @@ async function pushImportedPullRequestRefs(
         commit: item.commit,
       })),
     });
+    for (const item of pullRequestRefs) {
+      context.creationJournal?.recordCollaborationRefStage(item.eventId, target.id, "verified");
+    }
   }
 }
 
@@ -1401,6 +1458,18 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
         if (!tipCommit) {
           throw new Error(`Imported PR #${pr.number} has no tip commit`);
         }
+        context.creationJournal?.recordPendingCollaborationEvent({
+          sourceKey: source.sourceKey,
+          event: rootEvent,
+          canonicalRelayUrls: context.relayUrls,
+          ref: {
+            ref: `refs/nostr/${rootEvent.id}`,
+            commit: tipCommit,
+            targetIds: context.remotePushResults
+              .filter((result) => result.success && result.provider === "grasp")
+              .map((result) => result.id),
+          },
+        });
         await pushImportedPullRequestRefs(context, [
           {
             eventId: rootEvent.id,
@@ -1412,6 +1481,7 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
           },
         ]);
         await publishEventBatched(context, rootEvent);
+        await flushEventQueue(context);
         context.currentTimestamp += 1;
         totalPRs++;
         context.prsPublished = totalPRs;
@@ -1437,6 +1507,18 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
           created_at: context.currentTimestamp,
         });
         const signedUpdate = await signImportedEvent(context, update);
+        context.creationJournal?.recordPendingCollaborationEvent({
+          sourceKey: source.sourceKey,
+          event: signedUpdate,
+          canonicalRelayUrls: context.relayUrls,
+          ref: {
+            ref: `refs/nostr/${signedUpdate.id}`,
+            commit: pr.head.sha,
+            targetIds: context.remotePushResults
+              .filter((result) => result.success && result.provider === "grasp")
+              .map((result) => result.id),
+          },
+        });
         await pushImportedPullRequestRefs(context, [
           {
             eventId: signedUpdate.id,
@@ -1445,6 +1527,7 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
           },
         ]);
         await publishEventBatched(context, signedUpdate);
+        await flushEventQueue(context);
         context.currentTimestamp += 1;
       }
 
@@ -1479,8 +1562,12 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
         await publishEventBatched(context, await signImportedEvent(context, status));
         context.currentTimestamp += 1;
       }
+      await flushEventQueue(context);
       context.updateProgress(`Publishing PRs... (${totalPRs} published)`, totalPRs);
     }
+
+    await flushEventQueue(context);
+    context.creationJournal?.setCollaborationCursor("pull-requests", page);
 
     // Check if we should continue
     if (pagePrs.length < perPage) {
@@ -1522,6 +1609,7 @@ async function fetchAndPublishCommentsStreaming(
   // Check if the API supports bulk comment fetching
   const apiWithBulkComments = context.api;
   let totalCommentsPublished = 0;
+  let durableCommentCursor = 0;
   const commentEventMap: CommentEventMap = new Map(context.commentEventMap);
 
   const publishPullRequestComment = async (comment: Comment, prNumber: number) => {
@@ -1676,6 +1764,9 @@ async function fetchAndPublishCommentsStreaming(
         totalCommentsPublished
       );
 
+      await flushEventQueue(context);
+      context.creationJournal?.setCollaborationCursor("comments", ++durableCommentCursor);
+
       if (pageComments.length < perPage) {
         break;
       }
@@ -1764,6 +1855,9 @@ async function fetchAndPublishCommentsStreaming(
           }
         }
 
+        await flushEventQueue(context);
+        context.creationJournal?.setCollaborationCursor("comments", ++durableCommentCursor);
+
         if (pageComments.length < commentsPerPage) {
           break;
         }
@@ -1848,6 +1942,9 @@ async function fetchAndPublishCommentsStreaming(
           }
         }
 
+        await flushEventQueue(context);
+        context.creationJournal?.setCollaborationCursor("comments", ++durableCommentCursor);
+
         if (pageComments.length < commentsPerPage) {
           break;
         }
@@ -1877,6 +1974,8 @@ async function fetchAndPublishCommentsStreaming(
       )) {
         await publishPullRequestComment(comment, comment.pullRequestNumber);
       }
+      await flushEventQueue(context);
+      context.creationJournal?.setCollaborationCursor("comments", ++durableCommentCursor);
       if (comments.length < 100) break;
       page += 1;
     }
@@ -1893,6 +1992,8 @@ async function fetchAndPublishCommentsStreaming(
           })
         );
         for (const review of reviews) await publishPullRequestComment(review, prNumber);
+        await flushEventQueue(context);
+        context.creationJournal?.setCollaborationCursor("comments", ++durableCommentCursor);
         if (reviews.length < 100) break;
         page += 1;
       }
@@ -2487,6 +2588,7 @@ export function useImportRepo(options: UseImportRepoOptions) {
     onDeleteEvent,
     onRollbackPublishedRepoEvents,
     subscribeGitProgress,
+    secondaryRelayUrls = [],
   } = options;
 
   // Validate that we have a way to sign user events (repo events, status events)
@@ -2680,6 +2782,8 @@ export function useImportRepo(options: UseImportRepoOptions) {
         issuesPublished: 0,
         prsPublished: 0,
         commentsPublished: 0,
+        secondaryRelayUrls,
+        pendingReplicationCount: 0,
         remotePushResults: [],
         remoteTargets,
         selectedBranchRefs: [],
@@ -2826,12 +2930,14 @@ export function useImportRepo(options: UseImportRepoOptions) {
       signedRepoAnnouncement = publishedRepoEvents.announcement;
       signedRepoState = publishedRepoEvents.state;
       repoMetadataPublished = true;
+      transactionJournal.beginCollaboration();
       await loadCollaborationInventory(context);
 
       // Step 2: Stream issues (fetch, process, publish immediately)
       let issuesImported = 0;
       if (context.config.mirrorIssues) {
         currentPhaseRef.current = "issues";
+        transactionJournal.setCollaborationCursor("issues");
         const issueResult = await fetchAndPublishIssuesStreaming(context);
         issuesImported = issueResult.count;
         completedCountsRef.current.issues = issuesImported;
@@ -2841,6 +2947,7 @@ export function useImportRepo(options: UseImportRepoOptions) {
       let prsImported = 0;
       if (context.config.mirrorPullRequests) {
         currentPhaseRef.current = "pull_requests";
+        transactionJournal.setCollaborationCursor("pull-requests");
         prsImported = await fetchAndPublishPRsStreaming(context);
         completedCountsRef.current.pull_requests = prsImported;
       }
@@ -2849,6 +2956,7 @@ export function useImportRepo(options: UseImportRepoOptions) {
       let commentsImported = 0;
       if (context.config.mirrorComments) {
         currentPhaseRef.current = "comments";
+        transactionJournal.setCollaborationCursor("comments");
         const issueNumbers = new Set(Array.from(context.issueEventIdMap.keys()));
         const prNumbers = new Set(Array.from(context.prEventIdMap.keys()));
         commentsImported = await fetchAndPublishCommentsStreaming(context, issueNumbers, prNumbers);
@@ -2857,13 +2965,20 @@ export function useImportRepo(options: UseImportRepoOptions) {
 
       // Step 5: Publish user profiles encountered on the Git platform
       currentPhaseRef.current = "profiles";
+      transactionJournal.setCollaborationCursor("profiles");
       await publishProfileEvents(context);
 
       // Final flush: ensure all queued events are published before completing
       await flushEventQueue(context);
+      transactionJournal.markCollaborationComplete();
 
       // Complete
-      setProgress("complete", "Import completed successfully!");
+      setProgress(
+        "complete",
+        context.pendingReplicationCount > 0
+          ? `Canonical import completed; ${context.pendingReplicationCount} relay replication delivery(s) remain queued`
+          : "Import completed successfully!"
+      );
 
       // Final validation before returning result
       if (!context.finalRepo) {
@@ -2883,6 +2998,8 @@ export function useImportRepo(options: UseImportRepoOptions) {
         profilesCreated: context.userProfiles.size,
         repo: buildImportedRepoMetadata(context.finalRepo, context.config.destinationRepoName),
         remotePushResults: context.remotePushResults,
+        canonicalCollaborationComplete: true,
+        pendingReplicationCount: context.pendingReplicationCount,
       };
 
       if (context.localRepoId && context.workerApi?.deleteRepo) {
@@ -2956,7 +3073,9 @@ export function useImportRepo(options: UseImportRepoOptions) {
           transactionJournal.setLocalResourceStatus("unknown", err);
         }
       }
-      if (
+      if (transactionJournal?.record.collaboration.status === "pending") {
+        transactionJournal.setPhase("collaboration-pending", err);
+      } else if (
         !workerOutcomeUnknown &&
         (repoMetadataPublished || provisionalRollbackSucceeded) &&
         transactionJournal?.record.pendingCompensations.length === 0

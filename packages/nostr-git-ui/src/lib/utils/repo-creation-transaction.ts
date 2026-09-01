@@ -1,5 +1,6 @@
 import type { NostrEvent, RepoAnnouncementEvent } from "@nostr-git/core";
 import { normalizeRelayUrl, parseGraspRepoHttpUrl, sanitizeRelays } from "@nostr-git/core/utils";
+import { verifyEvent } from "nostr-tools";
 
 import type {
   DeleteRepoEvent,
@@ -23,7 +24,12 @@ import type { OperationStatus } from "@nostr-git/core";
 import { assertGraspCloneRelayCoupling } from "./grasp-service-coupling.js";
 
 export type RepoCreationOperation = "new" | "import" | "fork";
-export type RepoCreationPhase = "syncing" | "metadata-pending" | "cleanup-pending" | "failed";
+export type RepoCreationPhase =
+  | "syncing"
+  | "metadata-pending"
+  | "collaboration-pending"
+  | "cleanup-pending"
+  | "failed";
 export type RepoCreationTargetStage =
   | "planned"
   | "creating"
@@ -96,8 +102,40 @@ export interface RepoCreationEventAckEvidence {
   migrated?: boolean;
 }
 
+export type RepoCreationCollaborationPhase =
+  | "inventory"
+  | "issues"
+  | "pull-requests"
+  | "comments"
+  | "profiles"
+  | "complete";
+
+export interface RepoCreationCollaborationPendingEvent {
+  sourceKey: string;
+  event: NostrEvent;
+  canonicalRelayUrls: string[];
+  relayOutcomes: Array<{ relay: string; status: string; detail: string }>;
+  ref?: {
+    ref: string;
+    commit: string;
+    targets: Array<{
+      targetId: string;
+      stage: "planned" | "pushing" | "verified" | "unknown";
+      error?: string;
+    }>;
+  };
+  recordedAt: number;
+}
+
+export interface RepoCreationCollaborationCheckpoint {
+  status: "not-requested" | "pending" | "complete";
+  phase: RepoCreationCollaborationPhase;
+  cursors: Partial<Record<"issues" | "pullRequests" | "comments", number>>;
+  pendingEvent?: RepoCreationCollaborationPendingEvent;
+}
+
 export interface RepoCreationRecoveryRecord {
-  version: 2;
+  version: 3;
   id: string;
   operation: RepoCreationOperation;
   ownerPubkey: string;
@@ -134,6 +172,7 @@ export interface RepoCreationRecoveryRecord {
   >;
   publishedEvents: RepoCreationPublishedEvent[];
   eventAcks: RepoCreationEventAckEvidence[];
+  collaboration: RepoCreationCollaborationCheckpoint;
   workerOperations?: OperationStatus[];
   pendingCompensations: Array<{
     action: "delete" | "republish";
@@ -468,7 +507,7 @@ export class RepoCreationTransactionJournal {
   }) {
     const now = Date.now();
     this.#record = {
-      version: 2,
+      version: 3,
       id: params.id,
       operation: params.operation,
       ownerPubkey: params.ownerPubkey,
@@ -514,6 +553,7 @@ export class RepoCreationTransactionJournal {
       targetResults: [],
       publishedEvents: [],
       eventAcks: [],
+      collaboration: { status: "not-requested", phase: "inventory", cursors: {} },
       workerOperations: [],
       pendingCompensations: [],
       cleanup: { stage: "not-needed", manualAttention: false },
@@ -803,10 +843,166 @@ export class RepoCreationTransactionJournal {
     });
   }
 
-  complete(): void {
+  beginCollaboration(): void {
+    this.#update({
+      phase: "collaboration-pending",
+      collaboration: { status: "pending", phase: "inventory", cursors: {} },
+    });
+  }
+
+  setCollaborationCursor(phase: RepoCreationCollaborationPhase, cursor?: number): void {
+    if (this.#record.collaboration.pendingEvent) {
+      throw new Error("Cannot advance collaboration while an event is pending");
+    }
+    const key =
+      phase === "issues" ? "issues" : phase === "pull-requests" ? "pullRequests" : "comments";
+    this.#update({
+      collaboration: {
+        ...this.#record.collaboration,
+        status: phase === "complete" ? "complete" : "pending",
+        phase,
+        cursors:
+          cursor === undefined ||
+          phase === "inventory" ||
+          phase === "profiles" ||
+          phase === "complete"
+            ? this.#record.collaboration.cursors
+            : { ...this.#record.collaboration.cursors, [key]: cursor },
+      },
+    });
+  }
+
+  recordPendingCollaborationEvent(params: {
+    sourceKey: string;
+    event: NostrEvent;
+    canonicalRelayUrls: string[];
+    ref?: { ref: string; commit: string; targetIds: string[] };
+  }): void {
+    if (!params.event.id || !params.event.sig || !params.event.pubkey) {
+      throw new Error("Pending collaboration event must be exactly signed");
+    }
+    if (!verifyEvent(params.event)) {
+      throw new Error("Pending collaboration event has an invalid signature");
+    }
+    if (params.canonicalRelayUrls.length === 0) {
+      throw new Error("Pending collaboration event requires a canonical relay");
+    }
+    const existing = this.#record.collaboration.pendingEvent;
+    if (existing && existing.event.id !== params.event.id) {
+      throw new Error("A different collaboration event is already pending");
+    }
+    if (params.ref) {
+      if (
+        params.ref.ref !== `refs/nostr/${params.event.id}` ||
+        !/^[0-9a-f]{40}$/i.test(params.ref.commit)
+      ) {
+        throw new Error("Pending collaboration ref does not match the signed event");
+      }
+    }
+    this.#update({
+      phase: "collaboration-pending",
+      collaboration: {
+        ...this.#record.collaboration,
+        status: "pending",
+        pendingEvent: {
+          sourceKey: params.sourceKey,
+          event: { ...params.event, tags: params.event.tags.map((tag) => [...tag]) },
+          canonicalRelayUrls: sanitizeRelays(
+            params.canonicalRelayUrls.map((relay) => persistableRelayUrl(relay, this.#secrets))
+          ),
+          relayOutcomes: [],
+          ...(params.ref
+            ? {
+                ref: {
+                  ref: params.ref.ref,
+                  commit: params.ref.commit,
+                  targets: params.ref.targetIds.map((targetId) => ({
+                    targetId,
+                    stage: "planned" as const,
+                  })),
+                },
+              }
+            : {}),
+          recordedAt: Date.now(),
+        },
+      },
+    });
+  }
+
+  recordCollaborationRefStage(
+    eventId: string,
+    targetId: string,
+    stage: "pushing" | "verified" | "unknown",
+    error?: unknown
+  ): void {
+    const pending = this.#record.collaboration.pendingEvent;
+    if (!pending || pending.event.id !== eventId || !pending.ref) {
+      throw new Error("Pending collaboration ref was not found");
+    }
+    const message = this.#sanitizeError(error);
+    this.#update({
+      collaboration: {
+        ...this.#record.collaboration,
+        pendingEvent: {
+          ...pending,
+          ref: {
+            ...pending.ref,
+            targets: pending.ref.targets.map((target) =>
+              target.targetId === targetId
+                ? { ...target, stage, ...(message ? { error: message } : {}) }
+                : target
+            ),
+          },
+        },
+      },
+    });
+  }
+
+  recordCollaborationPublishResult(eventId: string, result: PublishRepoEventResult): boolean {
+    const pending = this.#record.collaboration.pendingEvent;
+    if (!pending || pending.event.id !== eventId || result.event.id !== eventId) {
+      throw new Error("Collaboration publisher returned a different event");
+    }
+    const ack = extractPublishRelayAck(result);
+    const canonical = new Set(pending.canonicalRelayUrls.map(relayUrlKey));
+    const accepted =
+      ack.hasRelayOutcomes && ack.ackedRelays.some((relay) => canonical.has(relayUrlKey(relay)));
+    const relayOutcomes = (ack.relayOutcomes || []).map((outcome) => ({
+      relay: persistableRelayUrl(outcome.relay, this.#secrets),
+      status: redactSecrets(outcome.status, this.#secrets) || "unknown",
+      detail: redactSecrets(outcome.detail, this.#secrets) || "",
+    }));
+    this.#update({
+      collaboration: {
+        ...this.#record.collaboration,
+        ...(accepted
+          ? { pendingEvent: undefined }
+          : { pendingEvent: { ...pending, relayOutcomes } }),
+      },
+    });
+    return accepted;
+  }
+
+  markCollaborationComplete(): void {
+    if (this.#record.collaboration.pendingEvent) {
+      throw new Error("Cannot complete collaboration with a pending event");
+    }
+    this.#update({
+      collaboration: { ...this.#record.collaboration, status: "complete", phase: "complete" },
+    });
+  }
+
+  complete(): boolean {
+    if (
+      this.#record.collaboration.status === "pending" ||
+      this.#record.collaboration.pendingEvent
+    ) {
+      this.setPhase("collaboration-pending");
+      return false;
+    }
     if (this.#record.pendingCompensations.length > 0) {
       this.setPhase("cleanup-pending");
-      return;
+      return false;
     }
     if (
       this.#record.operation !== "new" &&
@@ -814,10 +1010,11 @@ export class RepoCreationTransactionJournal {
       !["cleaned", "planned"].includes(this.#record.localResource.stage)
     ) {
       this.setPhase("cleanup-pending", this.#record.localResource.error);
-      return;
+      return false;
     }
     try {
       removeRecord(this.#record.id);
+      return true;
     } catch (error) {
       // Completion has no following side effect to guard; do not roll back a successful repository.
       this.#record = {
@@ -827,6 +1024,7 @@ export class RepoCreationTransactionJournal {
           reason: error instanceof Error ? error.message : String(error),
         },
       };
+      return false;
     }
   }
 
@@ -1373,7 +1571,7 @@ function migrateLegacyRecord(value: any): RepoCreationRecoveryRecord | undefined
     secrets
   );
   const migrated: RepoCreationRecoveryRecord = {
-    version: 2,
+    version: 3,
     id: String(value.id),
     operation: value.operation,
     ownerPubkey: String(value.ownerPubkey || ""),
@@ -1400,6 +1598,7 @@ function migrateLegacyRecord(value: any): RepoCreationRecoveryRecord | undefined
       recordedAt: now,
       migrated: true,
     })),
+    collaboration: { status: "not-requested", phase: "inventory", cursors: {} },
     workerOperations: [],
     pendingCompensations,
     cleanup:
@@ -1435,13 +1634,31 @@ function migrateLegacyRecord(value: any): RepoCreationRecoveryRecord | undefined
 
 function isRecoveryRecord(value: any): value is RepoCreationRecoveryRecord {
   return (
-    value?.version === 2 &&
+    value?.version === 3 &&
     Boolean(value.id && value.updatedAt) &&
     Array.isArray(value.targets) &&
     Array.isArray(value.targetResults) &&
     Array.isArray(value.publishedEvents) &&
-    Array.isArray(value.eventAcks)
+    Array.isArray(value.eventAcks) &&
+    Boolean(value.collaboration)
   );
+}
+
+function migrateV2Record(value: any): RepoCreationRecoveryRecord | undefined {
+  if (
+    value?.version !== 2 ||
+    !value.id ||
+    !Array.isArray(value.targets) ||
+    !Array.isArray(value.eventAcks)
+  ) {
+    return undefined;
+  }
+  return {
+    ...value,
+    version: 3,
+    collaboration: { status: "not-requested", phase: "inventory", cursors: {} },
+    updatedAt: Date.now(),
+  } as RepoCreationRecoveryRecord;
 }
 
 export function getPendingRepoCreationTransactions(
@@ -1503,20 +1720,27 @@ export function getPendingRepoCreationTransactions(
       continue;
     }
 
-    const record = isRecoveryRecord(value) ? value : migrateLegacyRecord(value);
+    const record = isRecoveryRecord(value)
+      ? value
+      : value?.version === 2
+        ? migrateV2Record(value)
+        : migrateLegacyRecord(value);
     if (!record) continue;
-    if (!isCurrent) {
+    const migrated = !isRecoveryRecord(value);
+    if (!isCurrent || migrated) {
       const current = records.get(record.id);
-      if (!current) writeRecord(record);
-      try {
-        storage.removeItem(key);
-      } catch (error) {
-        throw new RepoCreationJournalStorageError(
-          `Failed to finish repository creation journal migration ${record.id}`,
-          error
-        );
+      if (!current || migrated) writeRecord(record);
+      if (!isCurrent) {
+        try {
+          storage.removeItem(key);
+        } catch (error) {
+          throw new RepoCreationJournalStorageError(
+            `Failed to finish repository creation journal migration ${record.id}`,
+            error
+          );
+        }
       }
-      if (current) continue;
+      if (current && !migrated) continue;
     }
     const existing = records.get(record.id);
     if (!existing || existing.updatedAt <= record.updatedAt) records.set(record.id, record);
@@ -1528,9 +1752,63 @@ export function getPendingRepoCreationTransactions(
 export function persistRepoCreationRecoveryRecord(
   record: RepoCreationRecoveryRecord
 ): RepoCreationRecoveryRecord {
-  const next = { ...record, version: 2 as const, updatedAt: Date.now() };
+  const next = { ...record, version: 3 as const, updatedAt: Date.now() };
   writeRecord(next);
   return next;
+}
+
+export async function retryPendingRepoCreationCollaboration(params: {
+  record: RepoCreationRecoveryRecord;
+  publisher: PublishRepoEvent;
+  fetchRelayEvents: FetchRelayEvents;
+  workerApi?: {
+    listServerRefs?: (params: {
+      url: string;
+      symrefs: boolean;
+    }) => Promise<Array<{ ref?: string; oid?: string }>>;
+  };
+}): Promise<RepoCreationRecoveryRecord> {
+  const pending = params.record.collaboration.pendingEvent;
+  if (!pending) return params.record;
+  if (!verifyEvent(pending.event)) {
+    throw new Error("Pending collaboration event has an invalid signature");
+  }
+  const visible = await params.fetchRelayEvents({
+    relays: pending.canonicalRelayUrls,
+    filters: [{ ids: [pending.event.id] }],
+    timeoutMs: 10_000,
+    throwOnTimeout: true,
+  });
+  if (!visible.some((event) => event.id === pending.event.id && verifyEvent(event))) {
+    if (pending.ref) {
+      if (!params.workerApi?.listServerRefs) return params.record;
+      for (const targetRef of pending.ref.targets) {
+        const target = params.record.targets.find((item) => item.id === targetRef.targetId);
+        if (!target?.remoteUrl) return params.record;
+        const refs = await params.workerApi.listServerRefs({
+          url: target.remoteUrl,
+          symrefs: true,
+        });
+        if (!refs.some((ref) => ref.ref === pending.ref?.ref && ref.oid === pending.ref?.commit)) {
+          return params.record;
+        }
+      }
+    }
+    const result = await params.publisher(pending.event, { relays: pending.canonicalRelayUrls });
+    if (result.event.id !== pending.event.id) return params.record;
+    const ack = extractPublishRelayAck(result);
+    const canonical = new Set(pending.canonicalRelayUrls.map(relayUrlKey));
+    if (
+      !ack.hasRelayOutcomes ||
+      !ack.ackedRelays.some((relay) => canonical.has(relayUrlKey(relay)))
+    ) {
+      return params.record;
+    }
+  }
+  return persistRepoCreationRecoveryRecord({
+    ...params.record,
+    collaboration: { ...params.record.collaboration, pendingEvent: undefined },
+  });
 }
 
 export function removeRepoCreationRecoveryRecord(id: string): void {

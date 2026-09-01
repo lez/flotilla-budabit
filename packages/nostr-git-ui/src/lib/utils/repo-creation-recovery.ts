@@ -15,6 +15,7 @@ import {
   persistRepoCreationRecoveryRecord,
   removeRepoCreationRecoveryRecord,
   retryPendingRepoCreationMetadata,
+  retryPendingRepoCreationCollaboration,
   retryRepoCreationCompensations,
   type RepoCreationRecoveryRecord,
   type RepoCreationTargetRecord,
@@ -392,6 +393,57 @@ export async function recoverRepoCreationRecord(
       next.pendingCompensations.length === 0 &&
       (next.operation === "new" ||
         !next.localResource.ownedByTransaction ||
+        ["cleaned", "planned"].includes(next.localResource.stage))
+    ) {
+      removeRepoCreationRecoveryRecord(record.id);
+      return { status: "recovered" };
+    }
+    const pending = persistRepoCreationRecoveryRecord(next);
+    return { status: "pending", record: pending, reason: pending.manualAttention.reason };
+  }
+
+  if (record.phase === "collaboration-pending") {
+    let next = record;
+    try {
+      next = await retryPendingRepoCreationCollaboration({
+        record,
+        publisher: deps.publisher,
+        fetchRelayEvents: deps.fetchRelayEvents,
+        workerApi: deps.workerApi,
+      });
+    } catch (error) {
+      next = persistRepoCreationRecoveryRecord({
+        ...record,
+        manualAttention: {
+          required: true,
+          reason: error instanceof Error ? error.message : String(error),
+        },
+      });
+      return { status: "pending", record: next, reason: next.manualAttention.reason };
+    }
+    if (next.collaboration.pendingEvent) {
+      const pending = persistRepoCreationRecoveryRecord(next);
+      return {
+        status: "pending",
+        record: pending,
+        reason: "Canonical collaboration delivery remains unconfirmed",
+      };
+    }
+    if (next.collaboration.status !== "complete") {
+      const pending = persistRepoCreationRecoveryRecord({
+        ...next,
+        manualAttention: {
+          required: true,
+          reason: "Resume forge synchronization to continue collaboration import",
+        },
+      });
+      return { status: "pending", record: pending, reason: pending.manualAttention.reason };
+    }
+    next = await cleanupLocalResource(next, deps.workerApi);
+    if (
+      next.pendingCompensations.length === 0 &&
+      (!next.localResource.ownedByTransaction ||
+        next.operation === "new" ||
         ["cleaned", "planned"].includes(next.localResource.stage))
     ) {
       removeRepoCreationRecoveryRecord(record.id);
