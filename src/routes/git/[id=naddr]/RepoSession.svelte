@@ -7,6 +7,7 @@
     Repo,
     WorkerManager,
     ForkRepoDialog,
+    ForgeSyncDialog,
     graspServersStore,
     type ProfileSearchContext,
     type RepoCommunityOption,
@@ -32,7 +33,7 @@
   import {pushToast, popToast} from "@src/app/util/toast"
   import {notifications, hasRepoNotification, checked, setCheckedAt} from "@app/util/notifications"
   import {notifyCorsProxyIssue} from "@app/util/git-cors-proxy"
-  import {pushModal, clearModals} from "@app/util/modal"
+  import {pushModal, clearModals, closeTopModal} from "@app/util/modal"
   import DeleteRepoConfirm from "@app/components/DeleteRepoConfirm.svelte"
   import {getRepoRenameAddresses, recordRepoRename} from "@app/util/repo-rename-history"
   import RepoCollectModal from "@app/components/RepoCollectModal.svelte"
@@ -53,6 +54,7 @@
     getRepoPublicationAddress,
     requireRepoPublicationScope,
   } from "@app/core/repo-publication"
+  import {requireRepoForgeSyncScope} from "@app/core/repo-forge-sync"
   import RepoWatchModal from "@app/components/RepoWatchModal.svelte"
   import {nip19} from "nostr-tools"
   import type {NostrFilter, NostrEvent} from "@nostr-git/core"
@@ -107,6 +109,7 @@
     repository,
     tracker,
     pubkey,
+    session,
     profilesByPubkey,
     relaySearch,
     publishThunk,
@@ -1004,6 +1007,10 @@
   }
 
   const isOwnedRepo = $derived.by(() => !!$pubkey && repoPubkey === $pubkey)
+  const canSyncFromForge = $derived.by(() => {
+    const announcement = repoClass?.repoEvent as RepoAnnouncementEvent | undefined
+    return Boolean($pubkey && announcement && getRepoMaintainers(announcement).includes($pubkey))
+  })
 
   let myRepoStateEvents = $state<RepoStateEvent[]>([])
   let optimisticRepoStates = $state<Record<string, RepoStateEvent>>({})
@@ -2571,6 +2578,12 @@
     bookmarkRepo: () => bookmarkRepo(),
     openWatchModal: () => openWatchModal(),
     openRemoteFixModal: () => openRemoteFixModal(),
+    get syncFromForge() {
+      return canSyncFromForge ? () => openForgeSync() : undefined
+    },
+    get hasForgeSync() {
+      return [...getStore(issuesStore), ...getStore(pullRequestsStore)].some(isImportedEvent)
+    },
     get isRefreshing() {
       return isRefreshing
     },
@@ -3883,6 +3896,92 @@
       isolated: true,
     })
 
+  async function openForgeSync() {
+    const announcement = repoClass?.repoEvent as RepoAnnouncementEvent | undefined
+    if (!announcement || !$pubkey || !$session || !repoAddress) return
+    const syncingPubkey = $pubkey
+
+    const resolveScope = () => {
+      const current = repoClass?.repoEvent as RepoAnnouncementEvent | undefined
+      if (!current || !$pubkey) throw new Error("Repository announcement is unavailable")
+      if ($pubkey !== syncingPubkey) throw new Error("Active account changed during forge sync")
+      const scope = requireRepoForgeSyncScope({
+        announcement: current,
+        expectedRepoAddress: repoAddress,
+        viewerPubkey: $pubkey,
+        relayUrls: getStore(repoRelaysStore),
+      })
+      const graspTargets = scope.sourceCloneUrls.flatMap(url => {
+        try {
+          const host = new URL(url).host
+          const relay = scope.relayUrls.find(candidate => new URL(candidate).host === host)
+          return relay ? [{id: `grasp:${relay}`, label: host, remoteUrl: url}] : []
+        } catch {
+          return []
+        }
+      })
+      return {
+        ...scope,
+        localRepoId: repoClass?.repoId,
+        graspTargets,
+      }
+    }
+
+    let initialScope: ReturnType<typeof resolveScope>
+    try {
+      initialScope = resolveScope()
+    } catch (error) {
+      pushToast({message: error instanceof Error ? error.message : String(error), theme: "error"})
+      return
+    }
+
+    const {getSigner} = await import("@welshman/app")
+    const activeSigner = getSigner($session)
+    if (!activeSigner) {
+      pushToast({message: "The active account cannot sign forge imports", theme: "error"})
+      return
+    }
+    const worker = await ensureForkWorkerClient().catch(() => null)
+    const lastSyncKey = `repo-forge-sync:${initialScope.repoAddress}`
+    const lastSuccessfulAt = (() => {
+      const value = Number(localStorage.getItem(lastSyncKey) || 0)
+      return value > 0 ? new Date(value) : undefined
+    })()
+    pushModal(
+      ForgeSyncDialog,
+      {
+        repoLabel: repoClass?.name || repoName,
+        sourceOptions: initialScope.sourceOptions,
+        hasPriorSync: [...getStore(issuesStore), ...getStore(pullRequestsStore)].some(
+          isImportedEvent,
+        ),
+        lastSuccessfulAt,
+        resolveScope,
+        userPubkey: $pubkey,
+        workerApi: worker?.api,
+        onSignEvent: async (event: any) => {
+          resolveScope()
+          return activeSigner.sign(event)
+        },
+        onPublishEvent: async (event: NostrEvent) => {
+          const current = resolveScope()
+          const result = await publishRepoEventWithRelayOutcomes(event, current.relayUrls, {
+            repoAddress: current.repoAddress,
+          })
+          repository.publish(result.event as TrustedEvent)
+          return result
+        },
+        onFetchRelayEvents: fetchRepoRelayEvents,
+        onRefresh: async () => {
+          await Promise.all([refreshRepoAnnouncement(), repoRootHistory?.loadRecent()])
+        },
+        onComplete: () => localStorage.setItem(lastSyncKey, String(Date.now())),
+        onClose: closeTopModal,
+      },
+      {fullscreen: true, noEscape: true},
+    )
+  }
+
   async function forkRepo() {
     if (!repoClass) return
 
@@ -4429,7 +4528,18 @@
     </div>
   {/snippet}
   {#snippet action()}
-    <GitCommunityMenuButton />
+    <div class="flex items-center gap-1">
+      {#if canSyncFromForge}
+        <Button
+          class="btn btn-outline btn-sm flex-nowrap"
+          onclick={openForgeSync}
+          title="Import or sync collaboration from the announced forge">
+          <Activity class="h-4 w-4" />
+          <span class="hidden md:inline">Sync forge</span>
+        </Button>
+      {/if}
+      <GitCommunityMenuButton />
+    </div>
   {/snippet}
 </PageBar>
 

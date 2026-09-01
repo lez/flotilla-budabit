@@ -15,6 +15,7 @@
     RotateCcw,
     ChevronDown,
     HeartPulse,
+    RefreshCw,
   } from "@lucide/svelte"
   import {fade, fly, slide} from "@lib/transition"
   import Spinner from "@lib/components/Spinner.svelte"
@@ -745,6 +746,15 @@
           <HeartPulse class="h-4 w-4" />
           Health
         </Button>
+        {#if repoActions.syncFromForge}
+          <Button
+            class="btn btn-outline btn-sm gap-1"
+            onclick={repoActions.syncFromForge}
+            title="Import or sync issues, pull requests, and comments from the announced forge">
+            <RefreshCw class="h-4 w-4" />
+            {repoActions.hasForgeSync ? "Sync forge data" : "Import forge data"}
+          </Button>
+        {/if}
         <Button
           class="btn btn-outline btn-sm gap-1"
           onclick={repoActions.refreshRepo}

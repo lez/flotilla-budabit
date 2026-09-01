@@ -231,6 +231,31 @@ export interface ImportResult {
   pendingReplicationCount: number;
 }
 
+export interface ExistingRepoForgeSyncScope {
+  repoAddress: string;
+  ownerPubkey: string;
+  maintainerPubkeys: string[];
+  relayUrls: string[];
+  sourceCloneUrls: string[];
+  localRepoId?: string;
+  graspTargets?: Array<{ id: string; label: string; remoteUrl: string }>;
+}
+
+export interface ExistingRepoForgeSyncRequest {
+  resolveScope: () => ExistingRepoForgeSyncScope | Promise<ExistingRepoForgeSyncScope>;
+}
+
+export interface ForgeSyncResult {
+  issuesCreated: number;
+  pullRequestsCreated: number;
+  commentsCreated: number;
+  updatesCreated: number;
+  skipped: number;
+  profilesCreated: number;
+  canonicalCollaborationComplete: boolean;
+  pendingReplicationCount: number;
+}
+
 export type ImportRemoteProvider = "github" | "gitlab" | "gitea" | "bitbucket" | "grasp";
 
 export type ImportRemoteTarget = RemoteTargetSelection;
@@ -340,6 +365,8 @@ interface ImportContext {
   pendingReplicationCount: number;
   localRepoId?: string;
   sourceCloneUrls: string[];
+  repoOwnerPubkey: string;
+  repoMaintainerPubkeys: string[];
 
   // Timestamps
   importTimestamp: number;
@@ -365,6 +392,8 @@ interface ImportContext {
   issuesPublished: number;
   prsPublished: number;
   commentsPublished: number;
+  updatesPublished: number;
+  itemsSkipped: number;
 
   // Configuration
   config: ImportConfig;
@@ -439,8 +468,8 @@ async function loadCollaborationInventory(context: ImportContext): Promise<void>
   context.collaborationInventory = buildImportedCollaborationInventory({
     events,
     repoAddr: context.repoAddr,
-    repoOwner: context.userPubkey,
-    maintainers: [],
+    repoOwner: context.repoOwnerPubkey,
+    maintainers: context.repoMaintainerPubkeys,
   });
   for (const [sourceKey, event] of context.collaborationInventory.commentsBySourceKey) {
     context.commentEventMap.set(sourceKey, event.id);
@@ -1227,6 +1256,8 @@ async function fetchAndPublishIssuesStreaming(
         context.currentTimestamp += 1;
         totalIssues++;
         context.issuesPublished = totalIssues;
+      } else {
+        context.itemsSkipped += 1;
       }
       context.issueEventIdMap.set(issue.number, signedIssueEvent.id);
 
@@ -1254,6 +1285,7 @@ async function fetchAndPublishIssuesStreaming(
         await publishEventBatched(context, signedStatusEvent);
         context.currentTimestamp += 1;
         statusEventsPublished++;
+        context.updatesPublished += 1;
       }
       context.updateProgress(`Publishing issues... (${totalIssues} published)`, totalIssues);
     }
@@ -1485,6 +1517,8 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
         context.currentTimestamp += 1;
         totalPRs++;
         context.prsPublished = totalPRs;
+      } else {
+        context.itemsSkipped += 1;
       }
       context.prEventIdMap.set(pr.number, rootEvent.id);
 
@@ -1529,6 +1563,7 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
         await publishEventBatched(context, signedUpdate);
         await flushEventQueue(context);
         context.currentTimestamp += 1;
+        context.updatesPublished += 1;
       }
 
       const desiredStatus =
@@ -1561,6 +1596,7 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
         });
         await publishEventBatched(context, await signImportedEvent(context, status));
         context.currentTimestamp += 1;
+        context.updatesPublished += 1;
       }
       await flushEventQueue(context);
       context.updateProgress(`Publishing PRs... (${totalPRs} published)`, totalPRs);
@@ -1622,6 +1658,7 @@ async function fetchAndPublishCommentsStreaming(
       context.collaborationInventory?.commentsByProxy.get(`${source.provider}:${source.proxyUrl}`);
     if (existing) {
       commentEventMap.set(source.sourceKey, existing.id);
+      context.itemsSkipped += 1;
       return;
     }
     if (comment.inReplyToSourceKey && !commentEventMap.has(comment.inReplyToSourceKey)) return;
@@ -1690,6 +1727,7 @@ async function fetchAndPublishCommentsStreaming(
           );
         if (existing) {
           commentEventMap.set(source.sourceKey, existing.id);
+          context.itemsSkipped += 1;
           continue;
         }
 
@@ -1817,6 +1855,7 @@ async function fetchAndPublishCommentsStreaming(
             );
           if (existing) {
             commentEventMap.set(source.sourceKey, existing.id);
+            context.itemsSkipped += 1;
             continue;
           }
 
@@ -1904,6 +1943,7 @@ async function fetchAndPublishCommentsStreaming(
             );
           if (existing) {
             commentEventMap.set(source.sourceKey, existing.id);
+            context.itemsSkipped += 1;
             continue;
           }
 
@@ -2782,6 +2822,10 @@ export function useImportRepo(options: UseImportRepoOptions) {
         issuesPublished: 0,
         prsPublished: 0,
         commentsPublished: 0,
+        updatesPublished: 0,
+        itemsSkipped: 0,
+        repoOwnerPubkey: userPubkey,
+        repoMaintainerPubkeys: [],
         secondaryRelayUrls,
         pendingReplicationCount: 0,
         remotePushResults: [],
@@ -3113,6 +3157,211 @@ export function useImportRepo(options: UseImportRepoOptions) {
     }
   }
 
+  async function syncExistingRepository(
+    repoUrl: string,
+    token: string | null | undefined,
+    config: ImportConfig,
+    request: ExistingRepoForgeSyncRequest
+  ): Promise<ForgeSyncResult> {
+    if (isImporting) throw new Error("Import operation already in progress");
+    if (!onSignEvent || !onPublishEvent || !onFetchRelayEvents) {
+      throw new Error(
+        "Forge sync requires signing, publishing, and complete relay inventory access"
+      );
+    }
+
+    const resolveAuthorizedScope = async (expectedAddress?: string) => {
+      const scope = await request.resolveScope();
+      const [kind, owner] = scope.repoAddress.split(":");
+      const authority = new Set([scope.ownerPubkey, ...scope.maintainerPubkeys]);
+      if (
+        kind !== "30617" ||
+        owner !== scope.ownerPubkey ||
+        (expectedAddress && scope.repoAddress !== expectedAddress) ||
+        !authority.has(userPubkey)
+      ) {
+        throw new Error("Active account is not authorized by the current repository announcement");
+      }
+      const relayUrls = Array.from(new Set(scope.relayUrls.map(normalizeRelayUrl).filter(Boolean)));
+      if (relayUrls.length === 0) throw new Error("Repository announcement has no activity relays");
+      return { ...scope, relayUrls };
+    };
+
+    const initialScope = await resolveAuthorizedScope();
+    isImporting = true;
+    error = null;
+    abortController = new ImportAbortController();
+    currentPhaseRef.current = "connecting";
+    const rateLimiter = createRateLimiter(contextUpdateProgress);
+    const withRateLimit = createWithRateLimit(rateLimiter, abortController);
+    const operationId = createGitOperationId("import");
+    let journal: RepoCreationTransactionJournal | undefined;
+    const operationSession = new WorkerOperationSession(workerApi, operationId, 5000, (status) =>
+      journal?.recordWorkerOperationStatus(status)
+    );
+    activeOperationSession = operationSession;
+    const onOperationProgress = createGitOperationProgressObserver(
+      operationId,
+      (activity) => (operationActivity = activity)
+    );
+    const unsubscribeGitProgress = subscribeGitProgress?.(onOperationProgress);
+
+    try {
+      const partial = await initializeImportContext(
+        repoUrl,
+        token?.trim() || "",
+        { ...config, relays: initialScope.relayUrls },
+        userPubkey,
+        contextUpdateProgress,
+        abortController,
+        withRateLimit,
+        async (event) => {
+          await resolveAuthorizedScope(initialScope.repoAddress);
+          return onSignEvent(event);
+        },
+        async (event, publishContext) => {
+          const current = await resolveAuthorizedScope(initialScope.repoAddress);
+          if (
+            current.relayUrls.length !== initialScope.relayUrls.length ||
+            current.relayUrls.some((relay) => !initialScope.relayUrls.includes(relay))
+          ) {
+            throw new Error("Repository relay authority changed during forge sync");
+          }
+          return onPublishEvent(event, publishContext);
+        },
+        onDeleteEvent,
+        workerApi,
+        eventIO,
+        onFetchEvents,
+        onFetchRelayEvents
+      );
+      const finalRepo = await partial.withRateLimit(partial.platform, "GET", () =>
+        partial.api.getRepo(partial.parsed.owner, partial.parsed.repo)
+      );
+      const now = Math.floor(Date.now() / 1000);
+      const remotePushResults: ImportRemotePushResult[] = (initialScope.graspTargets || []).map(
+        (target) => ({
+          id: target.id,
+          label: target.label,
+          provider: "grasp",
+          success: true,
+          remoteUrl: target.remoteUrl,
+          createdRemote: false,
+          outcome: "ok",
+          pushedRefs: [],
+        })
+      );
+      const context: ImportContext = {
+        ...partial,
+        finalRepo,
+        repoAddr: initialScope.repoAddress,
+        repoOwnerPubkey: initialScope.ownerPubkey,
+        repoMaintainerPubkeys: initialScope.maintainerPubkeys,
+        relayUrls: initialScope.relayUrls,
+        secondaryRelayUrls,
+        pendingReplicationCount: 0,
+        localRepoId: initialScope.localRepoId,
+        sourceCloneUrls: Array.from(new Set([repoUrl, ...initialScope.sourceCloneUrls])),
+        importTimestamp: now,
+        startTimestamp: now - 3600,
+        currentTimestamp: now - 3600,
+        latestRepoMetadataCreatedAt: 0,
+        userProfiles: new Map(),
+        profileEvents: new Map(),
+        bridgedNostrPubkeys: new Map(),
+        nip39CheckedKeys: new Set(),
+        issueEventIdMap: new Map(),
+        prEventIdMap: new Map(),
+        commentEventMap: new Map(),
+        issuesPublished: 0,
+        prsPublished: 0,
+        commentsPublished: 0,
+        updatesPublished: 0,
+        itemsSkipped: 0,
+        rateLimiter,
+        remotePushResults,
+        remoteTargets: [],
+        operationId,
+        onOperationProgress,
+        operationSession,
+      };
+      journal = new RepoCreationTransactionJournal({
+        id: `forge-sync:${initialScope.repoAddress}:${now}`,
+        operation: "import",
+        ownerPubkey: initialScope.ownerPubkey,
+        repoName: initialScope.repoAddress.split(":").slice(2).join(":"),
+        localRepoId: initialScope.localRepoId,
+        localResource: { ownedByTransaction: false, stage: "planned" },
+        repositoryRelayUrls: initialScope.relayUrls,
+      });
+      journal.setTargetResults(remotePushResults);
+      context.creationJournal = journal;
+      journal.beginCollaboration();
+      await loadCollaborationInventory(context);
+
+      if (context.config.mirrorIssues) {
+        currentPhaseRef.current = "issues";
+        journal.setCollaborationCursor("issues");
+        await fetchAndPublishIssuesStreaming(context);
+      }
+      if (context.config.mirrorPullRequests) {
+        currentPhaseRef.current = "pull_requests";
+        journal.setCollaborationCursor("pull-requests");
+        await fetchAndPublishPRsStreaming(context);
+      }
+      if (context.config.mirrorComments) {
+        currentPhaseRef.current = "comments";
+        journal.setCollaborationCursor("comments");
+        await fetchAndPublishCommentsStreaming(
+          context,
+          new Set(context.issueEventIdMap.keys()),
+          new Set(context.prEventIdMap.keys())
+        );
+      }
+      currentPhaseRef.current = "profiles";
+      journal.setCollaborationCursor("profiles");
+      await publishProfileEvents(context);
+      await flushEventQueue(context);
+      journal.markCollaborationComplete();
+      journal.complete();
+
+      const result: ForgeSyncResult = {
+        issuesCreated: context.issuesPublished,
+        pullRequestsCreated: context.prsPublished,
+        commentsCreated: context.commentsPublished,
+        updatesCreated: context.updatesPublished,
+        skipped: context.itemsSkipped,
+        profilesCreated: context.userProfiles.size,
+        canonicalCollaborationComplete: true,
+        pendingReplicationCount: context.pendingReplicationCount,
+      };
+      setProgress(
+        "complete",
+        result.pendingReplicationCount > 0
+          ? `Forge sync completed; ${result.pendingReplicationCount} relay replication delivery(s) remain queued`
+          : "Forge sync completed"
+      );
+      return result;
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      if (journal?.record.collaboration.status === "pending") {
+        journal.setPhase("collaboration-pending", cause);
+      }
+      error = message;
+      if (progress) {
+        progress.error = message;
+        progress.isComplete = false;
+      }
+      throw cause instanceof ImportAbortedError ? cause : new Error(message);
+    } finally {
+      await operationSession.waitForTrackedOperations();
+      unsubscribeGitProgress?.();
+      isImporting = false;
+      abortController = null;
+      if (activeOperationSession === operationSession) activeOperationSession = null;
+    }
+  }
+
   /**
    * Abort the current import operation
    */
@@ -3125,6 +3374,7 @@ export function useImportRepo(options: UseImportRepoOptions) {
 
   return {
     importRepository,
+    syncExistingRepository,
     abortImport,
     get isImporting() {
       return isImporting;

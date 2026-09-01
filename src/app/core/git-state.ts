@@ -148,6 +148,8 @@ export type RepoActions = {
   bookmarkRepo: () => void | Promise<void>
   openWatchModal: () => void
   openRemoteFixModal: () => void
+  syncFromForge?: () => void | Promise<void>
+  readonly hasForgeSync?: boolean
   readonly isRefreshing: boolean
   readonly isBookmarked: boolean
   readonly isTogglingBookmark: boolean
