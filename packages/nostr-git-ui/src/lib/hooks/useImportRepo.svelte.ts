@@ -21,6 +21,7 @@ import {
   convertIssueStatusToEvent,
   convertCommentsToNostrEvents,
   convertPullRequestsToNostrEvents,
+  getPlatformSource,
   signEvent,
   type UserProfileMap,
   type CommentEventMap,
@@ -1010,6 +1011,14 @@ async function ensureUserProfile(context: ImportContext, username: string, avata
 
 // ===== Streaming Fetch and Publish Functions =====
 
+const isCreatedOrUpdatedSince = (
+  item: { createdAt: string; updatedAt: string },
+  sinceDate?: Date
+) => {
+  if (!sinceDate) return true;
+  return new Date(item.createdAt) >= sinceDate || new Date(item.updatedAt) >= sinceDate;
+};
+
 /**
  * Fetch and publish issues in streaming fashion (page-by-page)
  * Processes and publishes each issue immediately, keeping only ID mappings in memory
@@ -1046,9 +1055,7 @@ async function fetchAndPublishIssuesStreaming(
 
     const filteredIssues = pageIssues
       .filter((issue) => !issue.isPullRequest)
-      .filter((issue) =>
-        context.config.sinceDate ? new Date(issue.createdAt) >= context.config.sinceDate! : true
-      );
+      .filter((issue) => isCreatedOrUpdatedSince(issue, context.config.sinceDate));
 
     // Process and publish each issue immediately
     for (const issue of filteredIssues) {
@@ -1103,7 +1110,12 @@ async function fetchAndPublishIssuesStreaming(
           issue.state,
           originalDate,
           context.repoAddr,
-          context.currentTimestamp
+          context.currentTimestamp,
+          {
+            source: getPlatformSource(issue, context.platform, "issue"),
+            author: issue.state === "open" ? issue.author : issue.closedBy || issue.author,
+            updatedAt: issue.updatedAt,
+          }
         );
 
         context.abortController.throwIfAborted();
@@ -1234,20 +1246,19 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
         per_page: perPage,
         page,
         state: "all",
+        sort: "updated",
+        direction: "desc",
       })
     );
 
-    // Filter by sinceDate if provided
-    const filteredPrs = context.config.sinceDate
-      ? pagePrs.filter((pr) => {
-          const prDate = new Date(pr.createdAt);
-          return prDate >= context.config.sinceDate!;
-        })
-      : pagePrs;
-
-    if (filteredPrs.length === 0) {
+    if (pagePrs.length === 0) {
       break;
     }
+
+    // Filter by sinceDate if provided
+    const filteredPrs = pagePrs.filter((pr) =>
+      isCreatedOrUpdatedSince(pr, context.config.sinceDate)
+    );
 
     // Process and publish each PR immediately
     for (const pr of filteredPrs) {
@@ -1345,6 +1356,13 @@ async function fetchAndPublishPRsStreaming(context: ImportContext): Promise<numb
       break;
     }
 
+    if (
+      context.config.sinceDate &&
+      pagePrs.every((pr) => new Date(pr.updatedAt) < context.config.sinceDate!)
+    ) {
+      break;
+    }
+
     page++;
   }
 
@@ -1400,12 +1418,9 @@ async function fetchAndPublishCommentsStreaming(
       }
 
       // Filter by sinceDate if provided
-      const filteredComments = context.config.sinceDate
-        ? pageComments.filter((comment) => {
-            const commentDate = new Date(comment.createdAt);
-            return commentDate >= context.config.sinceDate!;
-          })
-        : pageComments;
+      const filteredComments = pageComments.filter((comment) =>
+        isCreatedOrUpdatedSince(comment, context.config.sinceDate)
+      );
 
       // Process and publish each comment immediately
       for (const comment of filteredComments) {
@@ -1468,7 +1483,7 @@ async function fetchAndPublishCommentsStreaming(
           await publishEventBatched(context, signedCommentEvent);
 
           // Store comment event ID for threading (within same issue/PR)
-          commentEventMap.set(convertedComment.platformCommentId, signedCommentEvent.id);
+          commentEventMap.set(convertedComment.platformCommentKey, signedCommentEvent.id);
 
           context.currentTimestamp += 1;
           totalCommentsPublished++;
@@ -1523,12 +1538,7 @@ async function fetchAndPublishCommentsStreaming(
 
         // Filter and publish each comment
         for (const comment of pageComments) {
-          if (context.config.sinceDate) {
-            const commentDate = new Date(comment.createdAt);
-            if (commentDate < context.config.sinceDate!) {
-              continue;
-            }
-          }
+          if (!isCreatedOrUpdatedSince(comment, context.config.sinceDate)) continue;
 
           await ensureUserProfile(context, comment.author.login, comment.author.avatarUrl);
 
@@ -1558,7 +1568,7 @@ async function fetchAndPublishCommentsStreaming(
             // Publish comment event (batched)
             await publishEventBatched(context, signedCommentEvent);
 
-            commentEventMap.set(convertedComment.platformCommentId, signedCommentEvent.id);
+            commentEventMap.set(convertedComment.platformCommentKey, signedCommentEvent.id);
             context.currentTimestamp += 1;
             totalCommentsPublished++;
             context.commentsPublished = totalCommentsPublished;
@@ -1605,12 +1615,7 @@ async function fetchAndPublishCommentsStreaming(
         }
 
         for (const comment of pageComments) {
-          if (context.config.sinceDate) {
-            const commentDate = new Date(comment.createdAt);
-            if (commentDate < context.config.sinceDate!) {
-              continue;
-            }
-          }
+          if (!isCreatedOrUpdatedSince(comment, context.config.sinceDate)) continue;
 
           await ensureUserProfile(context, comment.author.login, comment.author.avatarUrl);
 
@@ -1640,7 +1645,7 @@ async function fetchAndPublishCommentsStreaming(
             // Publish comment event (batched)
             await publishEventBatched(context, signedCommentEvent);
 
-            commentEventMap.set(convertedComment.platformCommentId, signedCommentEvent.id);
+            commentEventMap.set(convertedComment.platformCommentKey, signedCommentEvent.id);
             context.currentTimestamp += 1;
             totalCommentsPublished++;
             context.commentsPublished = totalCommentsPublished;

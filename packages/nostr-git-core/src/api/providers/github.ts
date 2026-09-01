@@ -23,7 +23,36 @@ import type {
   ListCommentsOptions,
   User,
   GitForkOptions,
+  PlatformActor,
+  PlatformObjectType,
+  PlatformSource,
+  PullRequestReview,
+  PullRequestReviewComment,
 } from "../api.js"
+
+const githubActor = (user: any): PlatformActor => {
+  const login = user?.login || "ghost"
+  return {
+    login,
+    avatarUrl: user?.avatar_url,
+    htmlUrl: user?.html_url || `https://github.com/${login}`,
+  }
+}
+
+const githubSource = (
+  objectType: PlatformObjectType,
+  data: any,
+  proxyUrl: string,
+): PlatformSource => {
+  const objectId = String(data?.id || data?.node_id || proxyUrl)
+  return {
+    provider: "github",
+    objectType,
+    objectId,
+    sourceKey: `github:${objectType}:${objectId}`,
+    proxyUrl,
+  }
+}
 
 /**
  * GitHub API client implementing GitServiceApi
@@ -327,10 +356,8 @@ export class GitHubApi implements GitServiceApi {
       title: issue.title,
       body: issue.body || "",
       state: issue.state === "closed" ? "closed" : "open",
-      author: {
-        login: issue.user.login,
-        avatarUrl: issue.user.avatar_url,
-      },
+      author: githubActor(issue.user),
+      source: githubSource(issue.pull_request ? "pull-request" : "issue", issue, issue.html_url),
       assignees: issue.assignees.map((assignee: any) => ({
         login: assignee.login,
         avatarUrl: assignee.avatar_url,
@@ -364,10 +391,8 @@ export class GitHubApi implements GitServiceApi {
       title: data.title,
       body: data.body || "",
       state: data.state === "closed" ? "closed" : "open",
-      author: {
-        login: data.user.login,
-        avatarUrl: data.user.avatar_url,
-      },
+      author: githubActor(data.user),
+      source: githubSource(data.pull_request ? "pull-request" : "issue", data, data.html_url),
       assignees: data.assignees.map((assignee: any) => ({
         login: assignee.login,
         avatarUrl: assignee.avatar_url,
@@ -496,11 +521,10 @@ export class GitHubApi implements GitServiceApi {
 
     return data.map(comment => ({
       id: comment.id,
+      source: githubSource("issue-comment", comment, comment.html_url),
+      kind: "conversation" as const,
       body: comment.body || "",
-      author: {
-        login: comment.user.login,
-        avatarUrl: comment.user.avatar_url,
-      },
+      author: githubActor(comment.user),
       createdAt: comment.created_at,
       updatedAt: comment.updated_at,
       url: comment.url,
@@ -518,16 +542,119 @@ export class GitHubApi implements GitServiceApi {
     return this.listIssueComments(owner, repo, prNumber, options)
   }
 
+  async listPullRequestConversationComments(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: ListCommentsOptions,
+  ): Promise<Comment[]> {
+    return this.listIssueComments(owner, repo, prNumber, options)
+  }
+
+  async listPullRequestReviews(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: {per_page?: number; page?: number},
+  ): Promise<PullRequestReview[]> {
+    const params = new URLSearchParams()
+    if (options?.per_page) params.append("per_page", options.per_page.toString())
+    if (options?.page) params.append("page", options.page.toString())
+    const query = params.toString()
+    const data = await this.request<any[]>(
+      `/repos/${owner}/${repo}/pulls/${prNumber}/reviews${query ? `?${query}` : ""}`,
+    )
+
+    return data.map(review => ({
+      id: review.id,
+      source: githubSource("pull-request-review", review, review.html_url),
+      kind: "review" as const,
+      state: String(review.state || "commented").toLowerCase() as PullRequestReview["state"],
+      body: review.body || "",
+      author: githubActor(review.user),
+      createdAt: review.submitted_at || "",
+      updatedAt: review.submitted_at || "",
+      submittedAt: review.submitted_at || "",
+      commitId: review.commit_id || undefined,
+      url: review.url,
+      htmlUrl: review.html_url,
+    }))
+  }
+
+  async listPullRequestReviewComments(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: ListCommentsOptions,
+  ): Promise<PullRequestReviewComment[]> {
+    return this.listReviewCommentsEndpoint(
+      `/repos/${owner}/${repo}/pulls/${prNumber}/comments`,
+      options,
+    )
+  }
+
+  async listAllPullRequestReviewComments(
+    owner: string,
+    repo: string,
+    options?: ListCommentsOptions,
+  ): Promise<Array<PullRequestReviewComment & {pullRequestNumber: number}>> {
+    const comments = await this.listReviewCommentsEndpoint(
+      `/repos/${owner}/${repo}/pulls/comments`,
+      options,
+    )
+    return comments.map(comment => ({
+      ...comment,
+      pullRequestNumber: Number(comment.url.match(/\/pulls\/(\d+)\/comments/)?.[1] || 0),
+    }))
+  }
+
+  private async listReviewCommentsEndpoint(
+    endpoint: string,
+    options?: ListCommentsOptions,
+  ): Promise<PullRequestReviewComment[]> {
+    const params = new URLSearchParams()
+    if (options?.since) params.append("since", options.since)
+    if (options?.per_page) params.append("per_page", options.per_page.toString())
+    if (options?.page) params.append("page", options.page.toString())
+    const query = params.toString()
+    const data = await this.request<any[]>(`${endpoint}${query ? `?${query}` : ""}`)
+
+    return data.map(comment => ({
+      id: comment.id,
+      source: githubSource("pull-request-review-comment", comment, comment.html_url),
+      kind: "inline" as const,
+      body: comment.body || "",
+      author: githubActor(comment.user),
+      createdAt: comment.created_at,
+      updatedAt: comment.updated_at,
+      url: comment.url,
+      htmlUrl: comment.html_url,
+      inReplyToId: comment.in_reply_to_id || undefined,
+      inReplyToSourceKey: comment.in_reply_to_id
+        ? `github:pull-request-review-comment:${comment.in_reply_to_id}`
+        : undefined,
+      pullRequestReviewId: comment.pull_request_review_id || undefined,
+      path: comment.path,
+      commitId: comment.commit_id || undefined,
+      originalCommitId: comment.original_commit_id || undefined,
+      line: comment.line ?? undefined,
+      originalLine: comment.original_line ?? undefined,
+      side: comment.side || undefined,
+      startLine: comment.start_line ?? undefined,
+      originalStartLine: comment.original_start_line ?? undefined,
+      startSide: comment.start_side || undefined,
+    }))
+  }
+
   async getComment(owner: string, repo: string, commentId: number): Promise<Comment> {
     const data = await this.request<any>(`/repos/${owner}/${repo}/issues/comments/${commentId}`)
 
     return {
       id: data.id,
+      source: githubSource("issue-comment", data, data.html_url),
+      kind: "conversation",
       body: data.body || "",
-      author: {
-        login: data.user.login,
-        avatarUrl: data.user.avatar_url,
-      },
+      author: githubActor(data.user),
       createdAt: data.created_at,
       updatedAt: data.updated_at,
       url: data.url,
@@ -560,11 +687,10 @@ export class GitHubApi implements GitServiceApi {
 
       return {
         id: comment.id,
+        source: githubSource("issue-comment", comment, comment.html_url),
+        kind: "conversation" as const,
         body: comment.body || "",
-        author: {
-          login: comment.user.login,
-          avatarUrl: comment.user.avatar_url,
-        },
+        author: githubActor(comment.user),
         createdAt: comment.created_at,
         updatedAt: comment.updated_at,
         url: comment.url,
@@ -604,10 +730,8 @@ export class GitHubApi implements GitServiceApi {
       title: pr.title,
       body: pr.body || "",
       state: pr.merged ? "merged" : pr.state === "closed" ? "closed" : "open",
-      author: {
-        login: pr.user.login,
-        avatarUrl: pr.user.avatar_url,
-      },
+      author: githubActor(pr.user),
+      source: githubSource("pull-request", pr, pr.html_url),
       head: {
         ref: pr.head.ref,
         sha: pr.head.sha,
@@ -696,10 +820,8 @@ export class GitHubApi implements GitServiceApi {
       title: data.title,
       body: data.body || "",
       state: data.merged ? "merged" : data.state === "closed" ? "closed" : "open",
-      author: {
-        login: data.user.login,
-        avatarUrl: data.user.avatar_url,
-      },
+      author: githubActor(data.user),
+      source: githubSource("pull-request", data, data.html_url),
       head: {
         ref: data.head.ref,
         sha: data.head.sha,

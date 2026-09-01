@@ -11,13 +11,13 @@ export {
   getCommitParent,
   getCommitMessageSummary,
   createPatchFromCommit,
-  areCommitsTooBigForPatches
+  areCommitsTooBigForPatches,
 } from "./git-utils.js"
 
 export * from "./isomorphic-git-provider.js"
 export * from "./cached-provider.js"
 export * from "./factory.js"
-export { createGitProvider } from "./factory.js"
+export {createGitProvider} from "./factory.js"
 
 export * from "./multi-vendor-git-provider.js"
 
@@ -42,16 +42,16 @@ export * from "./natural-read-transport.js"
 export * from "./natural-read-types.js"
 export * from "./natural-read-provider.js"
 
-export { type ImportConfig, DEFAULT_IMPORT_CONFIG, createImportConfig } from "./import-config.js"
-export { ImportAbortedError, ImportAbortController } from "./abort-controller.js"
-export { RateLimiter, type RateLimitConfig, type RateLimitStatus } from "./rate-limiter.js"
+export {type ImportConfig, DEFAULT_IMPORT_CONFIG, createImportConfig} from "./import-config.js"
+export {ImportAbortedError, ImportAbortController} from "./abort-controller.js"
+export {RateLimiter, type RateLimitConfig, type RateLimitStatus} from "./rate-limiter.js"
 export {
   DEFAULT_PROFILE_IMAGE_URL,
   generateRandomKeyPair,
   createProfileEventForPlatformUser,
   generatePlatformUserProfile,
   getProfileMapKey,
-  type PlatformUserProfile
+  type PlatformUserProfile,
 } from "./platform-profiles.js"
 export {
   convertRepoToNostrEvent,
@@ -60,10 +60,12 @@ export {
   convertIssueStatusToEvent,
   convertCommentsToNostrEvents,
   convertPullRequestsToNostrEvents,
+  getPlatformSource,
+  importedBridgeTags,
   signEvent,
   type UserProfileMap,
   type CommentEventMap,
-  type ConvertedComment
+  type ConvertedComment,
 } from "./platform-to-nostr.js"
 export {
   parseRepoUrl,
@@ -73,5 +75,5 @@ export {
   checkRepoOwnership,
   type ParsedRepoUrl,
   type TokenValidationResult,
-  type OwnershipResult
+  type OwnershipResult,
 } from "./import-utils.js"

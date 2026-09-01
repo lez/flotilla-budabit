@@ -5,8 +5,18 @@
  * with proper tagging, dating, and threading support.
  */
 
-import type {Issue, Comment, PullRequest, RepoMetadata} from "../api/api.js"
+import type {
+  Issue,
+  Comment,
+  PullRequest,
+  RepoMetadata,
+  PlatformActor,
+  PlatformObjectType,
+  PlatformSource,
+  PullRequestReviewComment,
+} from "../api/api.js"
 import type {NostrEvent} from "nostr-tools"
+import type {CommentTag} from "../events/nip22/nip22.js"
 import {finalizeEvent} from "nostr-tools"
 import {hexToBytes} from "nostr-tools/utils"
 import {
@@ -15,7 +25,8 @@ import {
   createStatusEvent,
   createRepoAnnouncementEvent,
   createRepoStateEvent,
-  createCommentEvent,
+  createGitCommentEvent,
+  createGitInlineCommentEvent,
   GIT_ISSUE,
   GIT_STATUS_OPEN,
   GIT_STATUS_CLOSED,
@@ -30,7 +41,48 @@ export type UserProfileMap = Map<string, {privkey: string; pubkey: string}>
  * Comment event mapping: platform comment ID -> Nostr event ID
  * Used for preserving comment threading
  */
-export type CommentEventMap = Map<number, string>
+export type CommentEventMap = Map<string, string>
+
+const fallbackSource = (
+  platform: string,
+  objectType: PlatformObjectType,
+  objectId: string | number,
+  proxyUrl: string,
+): PlatformSource => ({
+  provider: platform,
+  objectType,
+  objectId: String(objectId),
+  sourceKey: `${platform}:${objectType}:${objectId}`,
+  proxyUrl,
+})
+
+export const getPlatformSource = (
+  item: {id: number; htmlUrl: string; source?: PlatformSource},
+  platform: string,
+  objectType: PlatformObjectType,
+) => item.source || fallbackSource(platform, objectType, item.id, item.htmlUrl)
+
+export const importedBridgeTags = ({
+  source,
+  author,
+  createdAt,
+  updatedAt,
+}: {
+  source: PlatformSource
+  author: PlatformActor
+  createdAt: string
+  updatedAt: string
+}): string[][] => {
+  const originalDate = Math.floor(Date.parse(createdAt) / 1000)
+  const originalUpdatedAt = Math.floor(Date.parse(updatedAt) / 1000)
+  return [
+    ["proxy", source.proxyUrl, source.provider],
+    ["source-author", author.login || "ghost", author.htmlUrl || ""],
+    ["imported", ""],
+    ["original_date", String(originalDate)],
+    ["original_updated_at", String(originalUpdatedAt)],
+  ]
+}
 
 /**
  * Convert repository metadata to Nostr RepoAnnouncementEvent
@@ -137,7 +189,7 @@ export function convertIssuesToNostrEvents(
     }
 
     const labels = issue.labels.map(label => label.name)
-    const originalDate = Math.floor(Date.parse(issue.createdAt) / 1000)
+    const source = getPlatformSource(issue, platform, "issue")
 
     const baseEvent = createIssueEvent({
       content: issue.body || "",
@@ -150,8 +202,12 @@ export function convertIssuesToNostrEvents(
 
     const tags: string[][] = [
       ...baseEvent.tags,
-      ["imported", ""],
-      ["original_date", originalDate.toString()],
+      ...importedBridgeTags({
+        source,
+        author: issue.author,
+        createdAt: issue.createdAt,
+        updatedAt: issue.updatedAt,
+      }),
     ]
 
     const issueEvent: Omit<NostrEvent, "id" | "sig" | "pubkey"> = {
@@ -189,6 +245,11 @@ export function convertIssueStatusToEvent(
   originalDate: string,
   repoAddr: string,
   startTimestamp: number,
+  provenance?: {
+    source: PlatformSource
+    author: PlatformActor
+    updatedAt?: string
+  },
 ): Omit<NostrEvent, "id" | "sig" | "pubkey"> {
   const statusKind = issueState === "closed" ? GIT_STATUS_CLOSED : GIT_STATUS_OPEN
   const statusContent = issueState === "closed" ? "closed" : "open"
@@ -207,8 +268,17 @@ export function convertIssueStatusToEvent(
 
   const tags: string[][] = [
     ...baseEvent.tags,
-    ["imported", ""],
-    ["original_date", originalDateUnixSeconds.toString()],
+    ...(provenance
+      ? importedBridgeTags({
+          source: provenance.source,
+          author: provenance.author,
+          createdAt: originalDate,
+          updatedAt: provenance.updatedAt || originalDate,
+        })
+      : [
+          ["imported", ""],
+          ["original_date", originalDateUnixSeconds.toString()],
+        ]),
   ]
 
   const statusEvent: Omit<NostrEvent, "id" | "sig" | "pubkey"> = {
@@ -237,6 +307,7 @@ export interface ConvertedComment {
    * Original platform comment ID (for mapping after signing)
    */
   platformCommentId: number
+  platformCommentKey: string
 }
 
 export interface CommentConversionContext {
@@ -280,6 +351,7 @@ export function convertCommentsToNostrEvents(
   })
 
   for (const comment of sortedComments) {
+    if (comment.kind === "review" && !comment.body.trim()) continue
     const profileKey = `${platform}:${comment.author.login}`
     const profile = userProfiles.get(profileKey)
 
@@ -290,14 +362,23 @@ export function convertCommentsToNostrEvents(
       continue
     }
 
-    const originalDate = Math.floor(Date.parse(comment.createdAt) / 1000)
+    const objectType: PlatformObjectType =
+      comment.kind === "inline"
+        ? "pull-request-review-comment"
+        : comment.kind === "review"
+          ? "pull-request-review"
+          : "issue-comment"
+    const source = getPlatformSource(comment, platform, objectType)
 
     let parentRef:
       | {type: "e"; value: string; kind: string; pubkey?: string; relay?: string}
       | undefined
 
-    if (comment.inReplyToId) {
-      const parentEventId = commentEventMap.get(comment.inReplyToId)
+    const parentSourceKey =
+      comment.inReplyToSourceKey ||
+      (comment.inReplyToId ? `${platform}:${objectType}:${comment.inReplyToId}` : undefined)
+    if (parentSourceKey) {
+      const parentEventId = commentEventMap.get(parentSourceKey)
       if (parentEventId) {
         parentRef = {
           type: "e",
@@ -307,28 +388,46 @@ export function convertCommentsToNostrEvents(
       }
     }
 
-    const baseEvent = createCommentEvent({
+    const commentOptions = {
       content: comment.body || "",
       root: {
-        type: "E",
-        value: rootEventId,
-        kind: String(rootKind),
+        id: rootEventId,
+        kind: rootKind,
       },
-      parent: parentRef,
+      parent: parentRef
+        ? {
+            id: parentRef.value,
+            kind: Number(parentRef.kind),
+          }
+        : undefined,
       authorPubkey: profile.pubkey,
       created_at: currentTimestamp,
-      extraTags: context.repoAddr ? [["q", context.repoAddr]] : [],
-    })
-
-    const tags: string[][] = [
-      ...baseEvent.tags,
-      ["imported", ""],
-      ["original_date", originalDate.toString()],
-    ]
+      repoRefs: context.repoAddr ? [context.repoAddr] : [],
+      extraTags: importedBridgeTags({
+        source,
+        author: comment.author,
+        createdAt: comment.createdAt,
+        updatedAt: comment.updatedAt,
+      }) as CommentTag[],
+    }
+    const baseEvent =
+      comment.kind === "inline"
+        ? createGitInlineCommentEvent({
+            ...commentOptions,
+            filePath: (comment as PullRequestReviewComment).path,
+            commitId: (comment as PullRequestReviewComment).commitId,
+            line: String(
+              (comment as PullRequestReviewComment).line ||
+                (comment as PullRequestReviewComment).originalLine ||
+                "",
+            ),
+            lineSide: (comment as PullRequestReviewComment).side === "LEFT" ? "del" : undefined,
+          })
+        : createGitCommentEvent(commentOptions)
 
     const commentEvent: Omit<NostrEvent, "id" | "sig" | "pubkey"> = {
       ...baseEvent,
-      tags,
+      tags: baseEvent.tags,
     }
 
     currentTimestamp += 1
@@ -337,6 +436,7 @@ export function convertCommentsToNostrEvents(
       event: commentEvent,
       privkey: profile.privkey,
       platformCommentId: comment.id,
+      platformCommentKey: source.sourceKey,
     })
   }
 
@@ -388,7 +488,7 @@ export function convertPullRequestsToNostrEvents(
     }
 
     const labels: string[] = []
-    const originalDate = Math.floor(Date.parse(pr.createdAt) / 1000)
+    const source = getPlatformSource(pr, platform, "pull-request")
     const commits = prCommits?.get(pr.number)
     const tipCommitOid = commits && commits.length > 0 ? commits[commits.length - 1] : undefined
 
@@ -407,8 +507,12 @@ export function convertPullRequestsToNostrEvents(
 
     const tags: string[][] = [
       ...baseEvent.tags,
-      ["imported", ""],
-      ["original_date", originalDate.toString()],
+      ...importedBridgeTags({
+        source,
+        author: pr.author,
+        createdAt: pr.createdAt,
+        updatedAt: pr.updatedAt,
+      }),
     ]
 
     const prEvent: Omit<NostrEvent, "id" | "sig" | "pubkey"> = {

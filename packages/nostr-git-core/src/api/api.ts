@@ -14,6 +14,27 @@ import {RepoMetadata} from "../git/vendor-providers.js"
 // Re-export shared types from vendor-providers for convenience
 export type {GitVendor, RepoMetadata} from "../git/vendor-providers.js"
 
+export type PlatformObjectType =
+  | "issue"
+  | "pull-request"
+  | "issue-comment"
+  | "pull-request-review"
+  | "pull-request-review-comment"
+
+export interface PlatformSource {
+  provider: string
+  objectType: PlatformObjectType
+  objectId: string
+  sourceKey: string
+  proxyUrl: string
+}
+
+export interface PlatformActor {
+  login: string
+  avatarUrl?: string
+  htmlUrl?: string
+}
+
 /**
  * Commit information from Git service APIs
  */
@@ -49,10 +70,8 @@ export interface Issue {
   title: string
   body: string
   state: "open" | "closed"
-  author: {
-    login: string
-    avatarUrl?: string
-  }
+  author: PlatformActor
+  source?: PlatformSource
   assignees: Array<{
     login: string
     avatarUrl?: string
@@ -88,10 +107,9 @@ export interface Issue {
 export interface Comment {
   id: number
   body: string
-  author: {
-    login: string
-    avatarUrl?: string
-  }
+  author: PlatformActor
+  source?: PlatformSource
+  kind?: "conversation" | "review" | "inline"
   createdAt: string
   updatedAt: string
   url: string
@@ -101,6 +119,28 @@ export interface Comment {
    * Only present if this comment is a reply to another comment
    */
   inReplyToId?: number
+  inReplyToSourceKey?: string
+}
+
+export interface PullRequestReview extends Comment {
+  kind: "review"
+  state: "approved" | "changes_requested" | "commented" | "dismissed" | "pending"
+  commitId?: string
+  submittedAt: string
+}
+
+export interface PullRequestReviewComment extends Comment {
+  kind: "inline"
+  pullRequestReviewId?: number
+  path: string
+  commitId?: string
+  originalCommitId?: string
+  line?: number
+  originalLine?: number
+  side?: "LEFT" | "RIGHT"
+  startLine?: number
+  originalStartLine?: number
+  startSide?: "LEFT" | "RIGHT"
 }
 
 /**
@@ -125,10 +165,8 @@ export interface PullRequest {
   title: string
   body: string
   state: "open" | "closed" | "merged"
-  author: {
-    login: string
-    avatarUrl?: string
-  }
+  author: PlatformActor
+  source?: PlatformSource
   head: {
     ref: string
     sha: string
@@ -324,6 +362,29 @@ export interface GitServiceApi {
     prNumber: number,
     options?: ListCommentsOptions,
   ): Promise<Comment[]>
+  listPullRequestConversationComments?(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: ListCommentsOptions,
+  ): Promise<Comment[]>
+  listPullRequestReviews?(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: {per_page?: number; page?: number},
+  ): Promise<PullRequestReview[]>
+  listPullRequestReviewComments?(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    options?: ListCommentsOptions,
+  ): Promise<PullRequestReviewComment[]>
+  listAllPullRequestReviewComments?(
+    owner: string,
+    repo: string,
+    options?: ListCommentsOptions,
+  ): Promise<Array<PullRequestReviewComment & {pullRequestNumber: number}>>
   getComment(owner: string, repo: string, commentId: number): Promise<Comment>
   /**
    * List all issue comments for a repository (optional, more efficient for bulk imports)

@@ -67,6 +67,8 @@ export {
   convertIssueStatusToEvent,
   convertCommentsToNostrEvents,
   convertPullRequestsToNostrEvents,
+  getPlatformSource,
+  importedBridgeTags,
   signEvent,
   type UserProfileMap,
   type CommentEventMap,
@@ -82,6 +84,11 @@ export type {
   PullRequest as GitPullRequest,
   RepoMetadata,
   ListCommentsOptions,
+  PlatformActor,
+  PlatformObjectType,
+  PlatformSource,
+  PullRequestReview,
+  PullRequestReviewComment,
 } from "./api/api.js"
 
 // IO and event type exports

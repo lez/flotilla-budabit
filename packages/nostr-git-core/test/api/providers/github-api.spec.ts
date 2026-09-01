@@ -451,4 +451,98 @@ describe("GitHubApi request/shape mapping", () => {
     const out = await api.listTags(owner, repo)
     expect(out[0]).toMatchObject({name: "v1.0.0", commit: {sha: "t1"}})
   })
+
+  it("maps pull request review summaries with stable source identity", async () => {
+    globalThis.fetch = makeFetchOk([
+      {
+        id: 91,
+        node_id: "PRR_node",
+        state: "COMMENTED",
+        body: "Summary",
+        user: {login: "alice", avatar_url: "a", html_url: "https://github.com/alice"},
+        submitted_at: "2026-01-02T03:04:05Z",
+        commit_id: "a".repeat(40),
+        url: "https://api.github.com/reviews/91",
+        html_url: "https://github.com/octo/hello/pull/7#pullrequestreview-91",
+      },
+    ]) as any
+    const api = new GitHubApi(token)
+
+    const [review] = await api.listPullRequestReviews(owner, repo, 7, {per_page: 25, page: 2})
+
+    expect(review).toMatchObject({
+      kind: "review",
+      state: "commented",
+      submittedAt: "2026-01-02T03:04:05Z",
+      source: {
+        sourceKey: "github:pull-request-review:91",
+        proxyUrl: "https://github.com/octo/hello/pull/7#pullrequestreview-91",
+      },
+      author: {login: "alice", htmlUrl: "https://github.com/alice"},
+    })
+    expect((globalThis.fetch as any).mock.calls[0][0]).toContain(
+      "/repos/octo/hello/pulls/7/reviews?per_page=25&page=2",
+    )
+  })
+
+  it("maps inline review location and reply identity", async () => {
+    globalThis.fetch = makeFetchOk([
+      {
+        id: 102,
+        body: "Inline",
+        user: null,
+        created_at: "2026-01-02T03:04:05Z",
+        updated_at: "2026-01-02T04:05:06Z",
+        url: "https://api.github.com/repos/octo/hello/pulls/comments/102",
+        html_url: "https://github.com/octo/hello/pull/7#discussion_r102",
+        in_reply_to_id: 101,
+        pull_request_review_id: 91,
+        path: "src/file.ts",
+        commit_id: "b".repeat(40),
+        original_commit_id: "c".repeat(40),
+        line: null,
+        original_line: 42,
+        side: "LEFT",
+      },
+    ]) as any
+    const api = new GitHubApi(token)
+
+    const [comment] = await api.listPullRequestReviewComments(owner, repo, 7, {
+      since: "2026-01-01T00:00:00Z",
+    })
+
+    expect(comment).toMatchObject({
+      kind: "inline",
+      inReplyToSourceKey: "github:pull-request-review-comment:101",
+      path: "src/file.ts",
+      originalLine: 42,
+      side: "LEFT",
+      author: {login: "ghost"},
+      source: {sourceKey: "github:pull-request-review-comment:102"},
+    })
+    expect((globalThis.fetch as any).mock.calls[0][0]).toContain(
+      "/repos/octo/hello/pulls/7/comments?since=2026-01-01T00%3A00%3A00Z",
+    )
+  })
+
+  it("extracts PR numbers from the bulk inline review endpoint", async () => {
+    globalThis.fetch = makeFetchOk([
+      {
+        id: 103,
+        body: "Inline",
+        user: {login: "alice"},
+        created_at: "2026-01-02T03:04:05Z",
+        updated_at: "2026-01-02T03:04:05Z",
+        url: "https://api.github.com/repos/octo/hello/pulls/17/comments/103",
+        html_url: "https://github.com/octo/hello/pull/17#discussion_r103",
+        path: "README.md",
+      },
+    ]) as any
+    const api = new GitHubApi(token)
+
+    const [comment] = await api.listAllPullRequestReviewComments(owner, repo)
+
+    expect(comment.pullRequestNumber).toBe(17)
+    expect((globalThis.fetch as any).mock.calls[0][0]).toContain("/repos/octo/hello/pulls/comments")
+  })
 })
