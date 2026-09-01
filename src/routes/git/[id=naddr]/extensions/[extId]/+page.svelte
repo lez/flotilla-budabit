@@ -443,7 +443,7 @@
       title={extName}
       class="extension-iframe"
       class:loading
-      sandbox="allow-scripts allow-same-origin allow-forms"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
       onload={handleIframeLoad}
       onerror={handleIframeError}></iframe>
   </div>
